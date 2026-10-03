@@ -27,6 +27,21 @@ function getPublicUrl(request: NextRequest): string {
   return `${proto}://${forwardedHost}${pathname}${search}`;
 }
 
+// Phone numbers must never appear in full in any log line.
+function maskPhone(n: string): string {
+  return n.length < 4 ? "***" : "***" + n.slice(-4);
+}
+
+// Shape returned by the ingest_inbound_sms database function.
+interface IngestResult {
+  status: "stored" | "duplicate" | "unrouted" | "invalid";
+  business_id?: string;
+  lead_id?: string;
+  conversation_id?: string;
+  message_id?: string;
+  conversation_is_new?: boolean;
+}
+
 export async function POST(request: NextRequest) {
   // 1 + 2: read the raw form-encoded body and parse it.
   const rawBody = await request.text();
@@ -43,8 +58,8 @@ export async function POST(request: NextRequest) {
   const messageSid = parsed.get("MessageSid") ?? "";
 
   console.log("[twilio-webhook] inbound SMS", {
-    from,
-    to,
+    from: maskPhone(from),
+    to: maskPhone(to),
     messageSid,
     bodyLength: body.length,
   });
@@ -69,72 +84,48 @@ export async function POST(request: NextRequest) {
   try {
     const supabase = createAdminClient();
 
-    // 5: find the business that owns the destination number.
-    const { data: inboundNumber, error: lookupError } = await supabase
-      .from("inbound_numbers")
-      .select("business_id")
-      .eq("phone_number", to)
-      .eq("is_active", true)
-      .maybeSingle();
-
-    if (lookupError) {
-      console.error("[twilio-webhook] inbound_numbers lookup error", lookupError);
-      return twimlResponse();
-    }
-
-    if (!inboundNumber) {
-      console.warn(
-        "[twilio-webhook] no active inbound number registered for",
-        to,
-        "— ignoring",
-      );
-      return twimlResponse();
-    }
-
-    const businessId = inboundNumber.business_id;
-    console.log("[twilio-webhook] matched business", businessId);
-
-    // 6a: lead
-    const { data: lead, error: leadError } = await supabase
-      .from("leads")
-      .insert({
-        business_id: businessId,
-        status: "new",
-        source: "agent_inbound",
-      })
-      .select("id")
-      .single();
-    if (leadError) throw leadError;
-    console.log("[twilio-webhook] created lead", lead.id);
-
-    // 6b: conversation
-    const { data: conversation, error: convError } = await supabase
-      .from("conversations")
-      .insert({
-        business_id: businessId,
-        lead_id: lead.id,
-        channel: "sms",
-        customer_number: from,
-        business_number: to,
-        status: "active",
-      })
-      .select("id")
-      .single();
-    if (convError) throw convError;
-    console.log("[twilio-webhook] created conversation", conversation.id);
-
-    // 6c: message
-    const { error: msgError } = await supabase.from("messages").insert({
-      business_id: businessId,
-      conversation_id: conversation.id,
-      direction: "inbound",
-      body,
-      twilio_sid: messageSid,
+    // All intake work (dedupe, routing, conversation reuse, message insert)
+    // happens in one database function, in a single transaction.
+    const { data, error } = await supabase.rpc("ingest_inbound_sms", {
+      p_to: to,
+      p_from: from,
+      p_body: body,
+      p_sid: messageSid || null,
     });
-    if (msgError) throw msgError;
-    console.log("[twilio-webhook] stored inbound message", messageSid);
 
-    // 7: acknowledge with empty TwiML.
+    if (error) {
+      console.error("[twilio-webhook] ingest rpc error", error);
+      return twimlResponse();
+    }
+
+    const result = data as IngestResult;
+
+    switch (result.status) {
+      case "stored":
+        console.log("[twilio-webhook] stored inbound message", {
+          conversation_id: result.conversation_id,
+          message_id: result.message_id,
+          conversation_is_new: result.conversation_is_new,
+        });
+        break;
+      case "duplicate":
+        console.log(
+          "[twilio-webhook] duplicate delivery ignored",
+          result.conversation_id,
+        );
+        break;
+      case "unrouted":
+        console.warn(
+          "[twilio-webhook] no active inbound number for",
+          maskPhone(to),
+          "— ignoring",
+        );
+        break;
+      case "invalid":
+        console.warn("[twilio-webhook] invalid inbound payload — ignoring");
+        break;
+    }
+
     return twimlResponse();
   } catch (error) {
     console.error(
