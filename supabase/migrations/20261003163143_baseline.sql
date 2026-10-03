@@ -217,9 +217,9 @@ begin
   foreach t in array array['customers','service_locations','units','work_orders',
                            'technicians','inbound_numbers','leads','conversations','messages']
   loop
-    execute format('create policy %L on public.%I for select using (business_id in (select public.user_business_ids()))', 'select own ' || t, t);
-    execute format('create policy %L on public.%I for insert with check (business_id in (select public.user_business_ids()))', 'insert own ' || t, t);
-    execute format('create policy %L on public.%I for update using (business_id in (select public.user_business_ids())) with check (business_id in (select public.user_business_ids()))', 'update own ' || t, t);
-    execute format('create policy %L on public.%I for delete using (business_id in (select public.user_business_ids()))', 'delete own ' || t, t);
+    execute format('create policy %I on public.%I for select using (business_id in (select public.user_business_ids()))', 'select own ' || t, t);
+    execute format('create policy %I on public.%I for insert with check (business_id in (select public.user_business_ids()))', 'insert own ' || t, t);
+    execute format('create policy %I on public.%I for update using (business_id in (select public.user_business_ids())) with check (business_id in (select public.user_business_ids()))', 'update own ' || t, t);
+    execute format('create policy %I on public.%I for delete using (business_id in (select public.user_business_ids()))', 'delete own ' || t, t);
   end loop;
 end $$;
