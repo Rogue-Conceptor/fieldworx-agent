@@ -53,3 +53,5 @@ export const SAFETY_TEXT =
 
 export const FALLBACK_TEXT =
   "Sorry, our text assistant is having trouble right now. Please try again in a few minutes.";
+
+export const OPT_IN_TEXT = "Fieldworx Demo: Thanks for texting the Fieldworx Demo AI assistant. Msg frequency varies. Msg & data rates may apply. Reply HELP for help, STOP to opt out.";

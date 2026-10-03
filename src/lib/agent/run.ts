@@ -10,7 +10,12 @@ import {
 } from "./config";
 import { formatOutbound } from "./format";
 import { loadHistory } from "./history";
-import { classifyInbound, FALLBACK_TEXT, SAFETY_TEXT } from "./keywords";
+import {
+  classifyInbound,
+  FALLBACK_TEXT,
+  OPT_IN_TEXT,
+  SAFETY_TEXT,
+} from "./keywords";
 import { buildSystemPrompt, type AgentProfile } from "./prompt";
 import { sendOutbound } from "./send";
 
@@ -33,6 +38,7 @@ interface ProcessInboundArgs {
   customerNumber: string;
   businessNumber: string;
   inboundBody: string;
+  conversationIsNew: boolean;
   receivedAt: number;
 }
 
@@ -145,6 +151,31 @@ export async function processInbound(a: ProcessInboundArgs): Promise<void> {
       const total = await recordRun(supabase, a, { outcome: "skipped_keyword" });
       logRun("skipped_keyword", a.conversationId, total);
       return;
+    }
+
+    // 2b. first text of a new conversation: opt-in confirmation, sent exactly
+    // as written (not through formatOutbound) and with no agent_runs row of
+    // its own. A failure here must never block the agent's reply.
+    if (a.conversationIsNew) {
+      try {
+        const sent = await sendOutbound({
+          to: a.customerNumber,
+          from: a.businessNumber,
+          body: OPT_IN_TEXT,
+        });
+        const { error: optInStoreError } = await supabase
+          .from("messages")
+          .insert({
+            business_id: a.businessId,
+            conversation_id: a.conversationId,
+            direction: "outbound",
+            body: OPT_IN_TEXT,
+            twilio_sid: sent.sid,
+          });
+        if (optInStoreError) throw optInStoreError;
+      } catch (err) {
+        console.error("[agent] opt-in confirmation failed", shortError(err));
+      }
     }
 
     let outcome: Outcome;

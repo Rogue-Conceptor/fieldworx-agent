@@ -119,6 +119,7 @@ export async function POST(request: NextRequest) {
             customerNumber: from,
             businessNumber: to,
             inboundBody: body,
+            conversationIsNew: result.conversation_is_new === true,
             receivedAt,
           }),
         );

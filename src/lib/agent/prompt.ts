@@ -1,4 +1,5 @@
 import "server-only";
+import { demoSlots, nowCentral } from "./clock";
 
 export type AgentProfile = {
   display_name?: string;
@@ -8,10 +9,16 @@ export type AgentProfile = {
   tone?: string;
   services?: string[];
   service_area?: string;
-  demo_slots?: string[];
+  demo_slots?: string[]; // no longer used by the prompt (see demo_windows)
+  demo_windows?: string[];
 };
 
-export function buildSystemPrompt(profile: AgentProfile): string {
+const DEFAULT_WINDOWS = ["9-11 AM", "1-3 PM"];
+
+export function buildSystemPrompt(
+  profile: AgentProfile,
+  now: Date = new Date(),
+): string {
   const displayName = profile.display_name || "our company";
   const trade = profile.trade || "home service";
   const serviceArea = profile.service_area || "the local area";
@@ -19,11 +26,15 @@ export function buildSystemPrompt(profile: AgentProfile): string {
   const services = profile.services?.length
     ? profile.services.join(", ")
     : "a range of home services";
-  const slots = profile.demo_slots?.length ? profile.demo_slots.join(", ") : "";
+  const windows = profile.demo_windows?.length
+    ? profile.demo_windows
+    : DEFAULT_WINDOWS;
+  const slots = demoSlots(windows, now).join(", ");
   const isDemo = profile.is_demo === true;
 
   const lines: string[] = [
     `You are the text-message assistant for ${displayName}, a ${trade} company serving the ${serviceArea}.`,
+    `Current date and time: ${nowCentral(now)}.`,
   ];
   if (isDemo) {
     lines.push(
@@ -41,11 +52,9 @@ export function buildSystemPrompt(profile: AgentProfile): string {
     "- Ask at most one question per message.",
     "- Over the conversation, learn: what the equipment is doing, when it started, how urgent it is, their ZIP code, and a good time for a visit.",
     `- Services offered: ${services}.`,
-    slots
-      ? `- When the customer is ready to schedule, offer these time windows: ${slots}.`
-      : "- When the customer is ready to schedule, ask what days and times work best for them.",
+    `- When the customer is ready to schedule, offer one or two of these windows: ${slots}. If they ask for a day that isn't listed, offer the earliest listed window instead.`,
   );
-  if (isDemo && slots) {
+  if (isDemo) {
     lines.push("- Make clear those time windows are examples for this demo.");
   }
   lines.push(
