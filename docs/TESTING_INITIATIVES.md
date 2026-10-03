@@ -1,7 +1,7 @@
 # Fieldworx Agent — Testing Initiatives
 
-> **Version:** v1.2
-> **Last updated:** 2026-10-03 — first live `db push` verified; migrations replay-tested on scratch Postgres.
+> **Version:** v1.3
+> **Last updated:** 2026-10-03 — intake function, agent_runs, and agent loop v1 verified; live `updated_at` proven.
 > **Versioning:** Bump when a test moves from "not yet tested" to "verified," or a new open initiative is added. Log below.
 
 **What this file is:** The register of what's been verified, how, and what still needs testing. A test that "ran successfully" is not the same as a behavior that's "proven correct." This tracks the difference.
@@ -12,6 +12,7 @@
 
 ## Changelog
 
+- **v1.3** (2026-10-03) — Verified: migration #3 intake (12 scratch tests incl. two concurrent-session races; live conversation reuse); migration #4 (9 scratch tests); agent classifier/formatter (19 checks); clock and history logic (13 checks); agent loop live in log mode (replied, fallback, safety, error recording, opt-in confirmation, date awareness). `updated_at` now proven on LIVE. New open items: real-send path, live STOP/HELP, superseded and send_failed paths live, retention job, scenario evals.
 - **v1.2** (2026-10-03) — Verified: first live `db push` (migration #2), security advisors clean, migration replay on scratch Postgres. Behavioral tests on scratch DB: read isolation, write isolation (INSERT/UPDATE/DELETE), logged-out zero rows, `updated_at` trigger, anon blocked from helper. Live behavioral confirmation of the last three still pending. Found and fixed a replay-breaking bug in the baseline.
 - **v1.1** (2026-10-03) — Verified: Fieldworx connector scope; baseline migration integrity (hash, history, schema unchanged); config.toml secret scan. Added open items: `updated_at` behavior, logged-out query behavior, first live `db push`, advisor re-check after migration #2.
 - **v1.0** — Initial creation. Verified: read isolation (two methods), secrets-never-committed, build integrity, Twilio inbound pipeline end to end (incl. negative routing path). Open: write isolation, agent response loop, idempotency, Vercel signature validation, multi-tenant routing at scale, auth edge cases.
@@ -69,25 +70,58 @@ Two users, two businesses, one customer each. All passed:
 - **Connector witness:** history `baseline, hardening`; 11 tables; 42 policies all `{authenticated}`; 41 reference `private.user_business_ids` (the businesses INSERT policy uses `auth.uid()` directly); 9 `set_updated_at` triggers; helper exists only in `private`; `has_function_privilege` anon=false, authenticated=true; data unchanged (1 business, 1 message).
 - **Security advisors:** zero warnings.
 
+### Inbound intake function — migration #3 (2026-10-03)
+Scratch Postgres, all 12 passed: unrouted number creates nothing; first text creates lead + conversation + message; second text reuses the conversation (no new lead); Twilio redelivery returns `duplicate` and creates nothing; separate conversations per customer and per business; every message stamped with its conversation's business; only `service_role` can call it; empty input returns `invalid`.
+- **Race I10:** two sessions sent different first texts from the same new number at once — one conversation; the loser reused the winner's (`is_new: false`); zero orphan leads.
+- **Race I11:** the same message delivered twice at once — one message stored; the loser got `duplicate`.
+- **Bug found and fixed before push:** the race-recovery path skipped the `updated_at` touch.
+- **Live:** two real texts reused the existing conversation; lead count unchanged.
+
+### `updated_at` on LIVE (2026-10-03) — RESOLVED
+- Reused conversation: created Jul 6, `updated_at` moved to Oct 3 2:18 PM Central on the next text. Connector witness.
+
+### agent_runs + agent_profile — migration #4 (2026-10-03)
+Scratch, all 9 passed: service_role writes; one run per inbound message (unique); bad outcome rejected; each owner reads only their own runs; owner update/delete/insert attempts blocked (history intact); anon 0 rows; profile defaults `{}` and must be a JSON object. Live: connector confirmed RLS, single read policy, 43 policies all `authenticated`, seeded persona, advisors clean.
+
+### Agent logic — scratch checks against the real files (2026-10-03)
+- **19 checks:** STOP/stop./Help/cancel -> no reply; "yes", "Yes, Tuesday works", "please stop by tomorrow" -> normal; "it's burning up in here" -> normal; burning smell / gas / CO alarm / smoke -> safety; formatter adds prefix and STOP exactly once, strips markdown, caps at a sentence boundary, hard-caps unpunctuated text at 280; history round-trip exact.
+- **Bugs found by review before any live run:** `YES` would have silenced the agent on a normal "yes"; "burning" alone would have sent a 911 instruction to "it's burning up in here".
+- **13 checks:** Central date formatting; next 3 business days from Saturday start Mon Oct 5 and skip weekends; Friday rolls to Monday; prompt carries date and dated slots; opt-in confirmation excluded from history; history always ends on a user turn.
+
+### Agent loop — LIVE in log mode (2026-10-03)
+- **Replied:** three-turn conversation, 2.3–3.7 s inbound to reply ready; acknowledged, triaged urgency, remembered ZIP and symptom, labeled demo windows, never promised a visit.
+- **Opt-in confirmation:** new conversation received the registered text first, verbatim.
+- **Date awareness:** "tomorrow" on a Saturday -> recognized Sunday, offered Mon Oct 5; honored "morning".
+- **Safety:** "smell gas" -> fixed safety text, no model call, 422 ms.
+- **Fallback:** model failures produced the fallback text, escalated the lead, and recorded the error.
+- **Diagnosed live:** (1) Anthropic key not scoped to a workspace -> 400 on every call; fixed with a workspace key. (2) 300-token cap consumed by default adaptive thinking -> empty and cut-off replies; fixed with effort `low`, 2048 tokens, and never sending a reply that stopped at `max_tokens`.
+
 ---
 
 ## NOT YET TESTED (open initiatives)
+
+### Real outbound send (BLOCKED on A2P campaign approval)
+- Flip `OUTBOUND_MODE=send`; first reply to Jerry's own phone; confirm `twilio_sid` stored on outbound messages and on the opt-in confirmation.
+- Then: STOP from a real phone -> Twilio's opt-out reply, agent silent, run recorded `skipped_keyword`; HELP -> Twilio's help reply; further texts after STOP not answered.
+
+### Agent paths not yet seen live
+- `superseded` (two texts within a few seconds), `send_failed` (only possible in send mode), `error`.
+
+### 30-day retention (BLOCKER before sharing the number)
+- Promised in the live privacy policy. Build the deletion job, then prove a row older than 30 days is removed and a newer one is not.
+
+### Scenario eval suite (showcase)
+- Scripted conversations run against the agent: price shopper (must not quote), emergency (safety first), returning customer, out-of-area ZIP, "are you real?" (must disclose the demo), schedule-first customer (should still triage). Record pass/fail per scenario.
 
 ### Tenant isolation — WRITE path on LIVE (HIGH)
 - Proven on the scratch replica (T4/T5 above). Not yet exercised on the live project.
 - **Test to run when a writing UI exists:** as User A, attempt to INSERT a row into User B's business, and UPDATE/DELETE one of B's rows, through the app. All must fail.
 
-### `updated_at` behavior on LIVE
-- Triggers present on live (connector); behavior proven on scratch (T6). Live confirmation comes naturally when the agent loop first updates a lead or conversation: confirm `updated_at` moves, `created_at` does not.
-
 ### Logged-out query behavior on LIVE
 - Proven on scratch (T3). Live check: an anon REST read of `customers` (anon key, no session) — expect zero rows, no error. (`/test` logged out stops before querying, so it does not exercise this.)
 
-### Agent response loop (NOT BUILT)
-- Once built: verify inbound message -> Claude API -> outbound SMS actually reaches the phone; verify the outbound message is stored (direction `outbound`); verify multi-turn conversation continuity.
-
-### Idempotency / double-delivery
-- DB unique partial index on `messages.twilio_sid` exists but hasn't been tested against an actual Twilio retry. Simulate a duplicate SID -> second insert should fail gracefully, no duplicate chain.
+### Idempotency against a real Twilio retry
+- Duplicate delivery is proven on scratch (I4, I11). Not yet observed from an actual Twilio redelivery on live.
 
 ### Webhook signature validation on Vercel
 - Passed with ngrok. Vercel's proxy/forwarded-host setup differs; re-verify after deploy or legit requests could 403.
