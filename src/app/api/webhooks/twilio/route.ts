@@ -1,5 +1,7 @@
 import { NextRequest } from "next/server";
+import { waitUntil } from "@vercel/functions";
 import { validateRequest } from "twilio";
+import { processInbound } from "@/lib/agent/run";
 import { createAdminClient } from "@/lib/supabase/admin";
 
 // twilio's signature validation uses Node's crypto, so this must run on the
@@ -43,6 +45,7 @@ interface IngestResult {
 }
 
 export async function POST(request: NextRequest) {
+  const receivedAt = Date.now();
   // 1 + 2: read the raw form-encoded body and parse it.
   const rawBody = await request.text();
   const parsed = new URLSearchParams(rawBody);
@@ -107,6 +110,18 @@ export async function POST(request: NextRequest) {
           message_id: result.message_id,
           conversation_is_new: result.conversation_is_new,
         });
+        waitUntil(
+          processInbound({
+            businessId: result.business_id!,
+            conversationId: result.conversation_id!,
+            inboundMessageId: result.message_id!,
+            leadId: result.lead_id!,
+            customerNumber: from,
+            businessNumber: to,
+            inboundBody: body,
+            receivedAt,
+          }),
+        );
         break;
       case "duplicate":
         console.log(
