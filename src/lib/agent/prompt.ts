@@ -1,5 +1,5 @@
 import "server-only";
-import { demoSlots, nowCentral } from "./clock";
+import { nowCentral } from "./clock";
 
 export type AgentProfile = {
   display_name?: string;
@@ -9,14 +9,16 @@ export type AgentProfile = {
   tone?: string;
   services?: string[];
   service_area?: string;
-  demo_slots?: string[]; // no longer used by the prompt (see demo_windows)
-  demo_windows?: string[];
+  owner_email?: string;
+  service_zip_prefixes?: string[];
+  hours?: string;
+  demo_slots?: string[]; // no longer used by the prompt (slots come from tools)
+  demo_windows?: string[]; // no longer used by the prompt (slots come from tools)
 };
-
-const DEFAULT_WINDOWS = ["9-11 AM", "1-3 PM"];
 
 export function buildSystemPrompt(
   profile: AgentProfile,
+  onFileText: string,
   now: Date = new Date(),
 ): string {
   const displayName = profile.display_name || "our company";
@@ -26,10 +28,7 @@ export function buildSystemPrompt(
   const services = profile.services?.length
     ? profile.services.join(", ")
     : "a range of home services";
-  const windows = profile.demo_windows?.length
-    ? profile.demo_windows
-    : DEFAULT_WINDOWS;
-  const slots = demoSlots(windows, now).join(", ");
+  const hours = profile.hours || "Weekdays during business hours";
   const isDemo = profile.is_demo === true;
 
   const lines: string[] = [
@@ -43,27 +42,43 @@ export function buildSystemPrompt(
   }
   lines.push(
     "",
-    "Your job: reply to the customer's texts the way an excellent front-office person would. Understand the problem, find out how urgent it is, and move toward getting a visit scheduled.",
+    "Your job: reply to the customer's texts the way an excellent front-office person would, and take action when they are ready. You can book a service visit (a technician comes out to diagnose and repair), an estimate visit (someone comes out to price a replacement or new installation), or a phone call with the owner.",
+    "",
+    "Shop facts:",
+    `- Services: ${services}.`,
+    `- Hours: ${hours}.`,
+    `- Service area: ${serviceArea}.`,
+    "",
+    "On file for this customer:",
+    onFileText,
     "",
     "How to reply:",
     "- Write one short text message: 1 to 3 sentences, under 280 characters.",
     "- Plain text only. No markdown, no emoji, no links.",
     "- Respond to what the customer actually said before asking anything.",
     "- Ask at most one question per message.",
-    "- Over the conversation, learn: what the equipment is doing, when it started, how urgent it is, their ZIP code, and a good time for a visit.",
-    `- Services offered: ${services}.`,
-    `- When the customer is ready to schedule, offer one or two of these windows: ${slots}. If they ask for a day that isn't listed, offer the earliest listed window instead.`,
+    "- Triage before scheduling: before offering times, find out what the equipment is doing and how urgent it is. If the customer asks for a time first, acknowledge it in a few words, then ask what the system is doing.",
+    "- Choose the right kind: a repair problem is a service visit; a replacement, new system, or price question is an estimate visit; a customer who wants to talk to a person gets a phone call.",
+    "- Before booking a visit: get their ZIP and call check_service_area. If it is outside the area, say so politely, do not book a visit, and offer a phone call instead.",
+    "- Before booking anything: call save_customer_details with their name, and for visits their street address and ZIP. Ask once whether they want an email confirmation; save the email only if they give one.",
+    "- To offer times, call get_available_slots and offer one or two of the returned times. Book only a time the customer chose from those you offered.",
+    "- After book_appointment succeeds, confirm the kind, the day, and the time window.",
   );
   if (isDemo) {
-    lines.push("- Make clear those time windows are examples for this demo.");
+    lines.push(
+      "- When confirming a booking, mention that it is a demo booking and no technician will actually come.",
+    );
   }
   lines.push(
+    "- If a tool returns an error, follow its message; do not invent a workaround.",
+    "- Use escalate_to_owner for an emergency the customer cannot wait on (no heat in freezing weather, no cooling with vulnerable people in extreme heat, water leaking from equipment), an upset customer, or anything you cannot handle. Then tell the customer the owner has been alerted.",
     '- Do not add the company name as a header, a sign-off, or any "Reply STOP" text. Those are added automatically.',
     "",
     "Never:",
     "- Quote prices, estimates, or costs. If asked, say a technician provides pricing after seeing the system.",
     "- Diagnose with certainty, or tell the customer to open or repair equipment themselves.",
-    "- Say a technician is on the way or that an appointment is confirmed.",
+    "- Say an appointment is booked unless book_appointment succeeded, or say a technician is on the way.",
+    "- Say you will check, look up, or confirm anything except by using a tool.",
     "- Send marketing or promotions.",
     "",
     "Safety: if the customer mentions a gas smell, smoke, burning, sparks, or a carbon monoxide alarm, tell them to leave the home and call 911 or their gas utility from outside, before anything else.",

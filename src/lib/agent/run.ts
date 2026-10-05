@@ -6,8 +6,12 @@ import {
   AGENT_MODEL,
   CLAUDE_TIMEOUT_MS,
   MAX_TOKENS,
+  MAX_TOOL_ROUNDS,
   OUTBOUND_MODE,
+  RUN_DEADLINE_MS,
 } from "./config";
+import type { SlotKind } from "./clock";
+import { kindLabel } from "./emails";
 import { formatOutbound } from "./format";
 import { loadHistory } from "./history";
 import {
@@ -16,8 +20,10 @@ import {
   OPT_IN_TEXT,
   SAFETY_TEXT,
 } from "./keywords";
+import { formatOnFile, loadOnFile } from "./onfile";
 import { buildSystemPrompt, type AgentProfile } from "./prompt";
 import { sendOutbound } from "./send";
+import { executeTool, TOOL_DEFINITIONS, type ToolContext } from "./tools";
 
 type Outcome =
   | "replied"
@@ -42,6 +48,19 @@ interface ProcessInboundArgs {
   receivedAt: number;
 }
 
+// One entry per tool the model called, stored on the agent_runs row. `result`
+// is the JSON the model saw, cut to TOOL_RESULT_MAX characters.
+type ToolCallRecord = {
+  name: string;
+  ok: boolean;
+  wrote: boolean;
+  ms: number;
+  input: unknown;
+  result: string;
+};
+
+const TOOL_RESULT_MAX = 500;
+
 type RunFields = {
   outcome: Outcome;
   outbound_message_id?: string | null;
@@ -50,6 +69,7 @@ type RunFields = {
   output_tokens?: number | null;
   model_latency_ms?: number | null;
   error_code?: string | null;
+  tool_calls?: ToolCallRecord[];
 };
 
 // Mask anything phone-shaped so error text can never leak a full number.
@@ -113,26 +133,58 @@ async function recordRun(
     model_latency_ms: null,
     total_latency_ms: totalLatencyMs,
     error_code: null,
+    tool_calls: [],
     ...row,
   });
   if (error) throw error;
   return totalLatencyMs;
 }
 
-function logRun(outcome: Outcome, conversationId: string, totalLatencyMs: number) {
+// Tool names and ok flags only: never inputs, results, or anything the
+// customer said.
+function logRun(
+  outcome: Outcome,
+  conversationId: string,
+  totalLatencyMs: number,
+  toolCalls: ToolCallRecord[] = [],
+) {
   console.log("[agent] run complete", {
     outcome,
     conversation_id: conversationId,
     mode: OUTBOUND_MODE,
     total_latency_ms: totalLatencyMs,
+    tools: toolCalls.map((call) => ({ name: call.name, ok: call.ok })),
   });
 }
 
+// Built from the booking records, not the model, for when a booking succeeded
+// but the run then failed before the model could write the confirmation.
+function bookingConfirmation(
+  bookings: { kind: SlotKind; label: string }[],
+  isDemo: boolean,
+): string {
+  const parts = bookings.map((b) => {
+    const kind = kindLabel(b.kind);
+    const article = /^[aeiou]/i.test(kind) ? "an" : "a";
+    return `You're booked for ${article} ${kind}, ${b.label}.`;
+  });
+  if (isDemo) {
+    parts.push("This is a demo booking, so no technician will actually come.");
+  }
+  return parts.join(" ");
+}
+
 // Never throws: any unexpected failure is logged (masked) and recorded as an
-// "error" run when possible.
-export async function processInbound(a: ProcessInboundArgs): Promise<void> {
+// "error" run when possible. `deps` lets a test inject its own clients; left
+// out, the real ones are used.
+export async function processInbound(
+  a: ProcessInboundArgs,
+  deps?: { supabase?: Admin; anthropic?: Pick<Anthropic, "messages"> },
+): Promise<void> {
+  // Declared outside the try so an error run still records the tools that ran.
+  const toolCalls: ToolCallRecord[] = [];
   try {
-    const supabase = createAdminClient();
+    const supabase = deps?.supabase ?? createAdminClient();
 
     // 1. business profile -> reply prefix
     const { data: business, error: profileError } = await supabase
@@ -194,60 +246,184 @@ export async function processInbound(a: ProcessInboundArgs): Promise<void> {
       const history = await loadHistory(supabase, a.conversationId, prefix);
       let modelText = "";
       let failure: string | null = null;
+      // Every successful booking this run, for the code-built confirmation.
+      const bookings: { kind: SlotKind; label: string }[] = [];
+      const pastDeadline = () => Date.now() - a.receivedAt > RUN_DEADLINE_MS;
 
       if (history.length === 0) {
         failure = "empty_history";
       } else {
         model = AGENT_MODEL;
-        const started = Date.now();
-        try {
-          const response = await new Anthropic({
+        const onFile = await loadOnFile(supabase, {
+          businessId: a.businessId,
+          leadId: a.leadId,
+        });
+        const system = buildSystemPrompt(profile, formatOnFile(onFile));
+        const anthropic =
+          deps?.anthropic ??
+          new Anthropic({
             timeout: CLAUDE_TIMEOUT_MS,
             maxRetries: 1,
-          }).messages.create({
-            model: AGENT_MODEL,
-            max_tokens: MAX_TOKENS,
-            thinking: { type: "adaptive" },
-            output_config: { effort: AGENT_EFFORT },
-            system: buildSystemPrompt(profile),
-            messages: history,
           });
-          modelLatencyMs = Date.now() - started;
-          inputTokens = response.usage.input_tokens;
-          outputTokens = response.usage.output_tokens;
+        // Business, number, conversation and lead come from this inbound
+        // message, never from the model.
+        const toolContext: ToolContext = {
+          supabase,
+          businessId: a.businessId,
+          conversationId: a.conversationId,
+          leadId: a.leadId,
+          customerNumber: a.customerNumber,
+          profile,
+          now: new Date(),
+        };
+        const messages: Anthropic.MessageParam[] = [...history];
+        inputTokens = 0;
+        outputTokens = 0;
+        modelLatencyMs = 0;
+
+        // At most MAX_TOOL_ROUNDS rounds of tool calls, then one more model
+        // call that has to produce the reply.
+        for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+          // The call gets what is left of the run's budget, minus 2 s so the
+          // reply can still be stored and sent. With under 10 s left there is
+          // no time for a retry.
+          const remaining = RUN_DEADLINE_MS - (Date.now() - a.receivedAt);
+          if (remaining - 2000 <= 0) {
+            failure = "deadline";
+            break;
+          }
+          const started = Date.now();
+          let response: Anthropic.Message;
+          try {
+            response = await anthropic.messages.create(
+              {
+                model: AGENT_MODEL,
+                max_tokens: MAX_TOKENS,
+                thinking: { type: "adaptive" },
+                output_config: { effort: AGENT_EFFORT },
+                system,
+                tools: TOOL_DEFINITIONS,
+                messages,
+              },
+              {
+                timeout: Math.min(CLAUDE_TIMEOUT_MS, remaining - 2000),
+                maxRetries: remaining < 10000 ? 0 : 1,
+              },
+            );
+          } catch (err) {
+            modelLatencyMs += Date.now() - started;
+            failure = shortError(err);
+            break;
+          }
+          modelLatencyMs += Date.now() - started;
+          inputTokens += response.usage.input_tokens;
+          outputTokens += response.usage.output_tokens;
+
+          // Partial text is never sent: a cut-off reply is a failure.
+          if (response.stop_reason === "max_tokens") {
+            failure = "max_tokens";
+            break;
+          }
+
+          if (response.stop_reason === "tool_use") {
+            if (round === MAX_TOOL_ROUNDS) {
+              failure = "tool_rounds_exceeded";
+              break;
+            }
+            // The assistant turn goes back exactly as returned, thinking
+            // blocks included: the API requires them unmodified with tools.
+            messages.push({ role: "assistant", content: response.content });
+
+            const results: Anthropic.ToolResultBlockParam[] = [];
+            for (const block of response.content) {
+              if (block.type !== "tool_use") continue;
+              if (pastDeadline()) {
+                failure = "deadline";
+                break;
+              }
+              const toolStarted = Date.now();
+              const outcome = await executeTool(block.name, block.input, toolContext);
+              const resultJson = JSON.stringify(outcome.result);
+              if (
+                block.name === "book_appointment" &&
+                outcome.ok &&
+                typeof outcome.result.kind === "string" &&
+                typeof outcome.result.label === "string"
+              ) {
+                bookings.push({
+                  kind: outcome.result.kind as SlotKind,
+                  label: outcome.result.label,
+                });
+              }
+              toolCalls.push({
+                name: block.name.slice(0, 64),
+                ok: outcome.ok,
+                wrote: outcome.wrote,
+                ms: Date.now() - toolStarted,
+                input: block.input,
+                result: resultJson.slice(0, TOOL_RESULT_MAX),
+              });
+              results.push({
+                type: "tool_result",
+                tool_use_id: block.id,
+                content: resultJson,
+                is_error: !outcome.ok,
+              });
+            }
+            if (failure !== null) break;
+            if (results.length === 0) {
+              failure = "empty_response";
+              break;
+            }
+            messages.push({ role: "user", content: results });
+            continue;
+          }
+
           modelText = response.content
             .flatMap((block) => (block.type === "text" ? [block.text] : []))
             .join("")
             .trim();
-          // Partial text is never sent: a cut-off reply is a failure.
-          if (response.stop_reason === "max_tokens") failure = "max_tokens";
-          else if (!modelText) failure = "empty_response";
-        } catch (err) {
-          modelLatencyMs = Date.now() - started;
-          failure = shortError(err);
+          if (!modelText) failure = "empty_response";
+          break;
         }
       }
 
+      const wroteSomething = toolCalls.some((call) => call.ok && call.wrote);
+
       if (failure !== null) {
-        outcome = "fallback";
         errorCode = failure;
-        replyText = formatOutbound(FALLBACK_TEXT, prefix);
-        const { error: escalateError } = await supabase
-          .from("leads")
-          .update({ status: "escalated" })
-          .eq("id", a.leadId);
-        if (escalateError) {
-          console.error(
-            "[agent] lead escalation failed",
-            maskPhones(escalateError.message).slice(0, 120),
+        if (bookings.length > 0) {
+          // The customer is booked: confirm from the records, and leave the
+          // lead as the booking left it.
+          outcome = "replied";
+          replyText = formatOutbound(
+            bookingConfirmation(bookings, profile.is_demo === true),
+            prefix,
           );
+        } else {
+          outcome = "fallback";
+          replyText = formatOutbound(FALLBACK_TEXT, prefix);
+          // No booking, so a person has to pick this up, even if other tools
+          // (saved details, an alert) wrote along the way.
+          const { error: escalateError } = await supabase
+            .from("leads")
+            .update({ status: "escalated" })
+            .eq("id", a.leadId);
+          if (escalateError) {
+            console.error(
+              "[agent] lead escalation failed",
+              maskPhones(escalateError.message).slice(0, 120),
+            );
+          }
         }
       } else {
         outcome = "replied";
         replyText = formatOutbound(modelText, prefix);
       }
 
-      // 4. a newer inbound message means this reply is stale
+      // 4. a newer inbound message means this reply is stale, unless a tool
+      // already changed something (a booking, saved details, an alert): then
+      // the customer must hear about it, so the reply always goes out.
       const { data: newest, error: newestError } = await supabase
         .from("messages")
         .select("id")
@@ -257,15 +433,16 @@ export async function processInbound(a: ProcessInboundArgs): Promise<void> {
         .limit(1)
         .maybeSingle();
       if (newestError) throw newestError;
-      if (newest && newest.id !== a.inboundMessageId) {
+      if (newest && newest.id !== a.inboundMessageId && !wroteSomething) {
         const total = await recordRun(supabase, a, {
           outcome: "superseded",
           model,
           input_tokens: inputTokens,
           output_tokens: outputTokens,
           model_latency_ms: modelLatencyMs,
+          tool_calls: toolCalls,
         });
-        logRun("superseded", a.conversationId, total);
+        logRun("superseded", a.conversationId, total, toolCalls);
         return;
       }
     }
@@ -313,17 +490,19 @@ export async function processInbound(a: ProcessInboundArgs): Promise<void> {
       output_tokens: outputTokens,
       model_latency_ms: modelLatencyMs,
       error_code: errorCode,
+      tool_calls: toolCalls,
     });
 
     // 8. one log line, no bodies, no phone numbers
-    logRun(outcome, a.conversationId, total);
+    logRun(outcome, a.conversationId, total, toolCalls);
   } catch (err) {
     const code = shortError(err);
     console.error("[agent] unexpected error", code);
     try {
-      await recordRun(createAdminClient(), a, {
+      await recordRun(deps?.supabase ?? createAdminClient(), a, {
         outcome: "error",
         error_code: code,
+        tool_calls: toolCalls,
       });
     } catch (inner) {
       console.error("[agent] could not record error run", shortError(inner));

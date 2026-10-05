@@ -17,3 +17,26 @@ export const AGENT_EFFORT: "low" | "medium" | "high" =
     : "low";
 export const CLAUDE_TIMEOUT_MS = 20000;
 export const MAX_REPLY_CHARS = 280;
+
+// Anything other than exactly "send" means "log": emails are recorded in
+// notifications but never sent through Resend.
+export const EMAIL_MODE: "log" | "send" =
+  process.env.EMAIL_MODE === "send" ? "send" : "log";
+export const EMAIL_FROM = "Fieldworx Demo <bookings@notify.jerrster.com>";
+
+export const MAX_TOOL_ROUNDS = 5;
+
+// Wall-clock budget for one run, measured from when the webhook received the
+// message. Past it, no new model call or tool execution starts.
+export const RUN_DEADLINE_MS = 45000;
+
+// Bookable time windows, Central time. Visits are ranges; calls are a start
+// time plus a duration.
+export const VISIT_WINDOWS = [
+  { startHour: 9, endHour: 11, label: "9-11 AM" },
+  { startHour: 13, endHour: 15, label: "1-3 PM" },
+];
+export const CALL_TIMES = [
+  { hour: 10, minute: 0, durationMin: 30, label: "10:00 AM" },
+  { hour: 15, minute: 0, durationMin: 30, label: "3:00 PM" },
+];

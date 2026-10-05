@@ -7,6 +7,7 @@ import { createAdminClient } from "@/lib/supabase/admin";
 // twilio's signature validation uses Node's crypto, so this must run on the
 // Node.js runtime (not Edge).
 export const runtime = "nodejs";
+export const maxDuration = 60;
 
 const EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
 
