@@ -2,7 +2,7 @@ import "server-only";
 import type Anthropic from "@anthropic-ai/sdk";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { isValidEmail, normalizeZip, zipInArea } from "./area";
-import { buildSlots, openSlots, type Slot, type SlotKind } from "./clock";
+import { buildSlots, openSlots, slotLabel, type Slot, type SlotKind } from "./clock";
 import {
   bookingCustomerEmail,
   bookingOwnerEmail,
@@ -73,7 +73,7 @@ export const TOOL_DEFINITIONS: Anthropic.Tool[] = [
   {
     name: "save_customer_details",
     description:
-      "Save what the customer has told you: their name, and for visits their street address and ZIP, and an email only if they chose to give one. Safe to call again to add details.",
+      "Save what the customer has told you: their name, and for visits their street address and ZIP, and an email only if they chose to give one. Safe to call again to add details. Saving an email after a booking also sends the confirmation for that booking.",
     input_schema: {
       type: "object",
       properties: {
@@ -91,14 +91,15 @@ export const TOOL_DEFINITIONS: Anthropic.Tool[] = [
   {
     name: "book_appointment",
     description:
-      "Book the appointment the customer chose. slot_start must be exactly a start value returned by get_available_slots for the same kind. The customer's name must be saved first, and a visit also needs a saved street address and ZIP inside the service area.",
+      "Book the appointment the customer chose. slot must be the time exactly as you offered it, for example \"Mon Oct 5, 9-11 AM\" (or its ISO start time from get_available_slots), and it must be open for the same kind. The customer's name must be saved first, and a visit also needs a saved street address and ZIP inside the service area.",
     input_schema: {
       type: "object",
       properties: {
         kind: { type: "string", enum: [...KINDS] },
-        slot_start: {
+        slot: {
           type: "string",
-          description: "The start value of the chosen slot, copied from get_available_slots.",
+          description:
+            "The chosen time, exactly as you offered it, for example \"Mon Oct 5, 9-11 AM\". An ISO start time from get_available_slots also works.",
         },
         issue_summary: {
           type: "string",
@@ -106,7 +107,7 @@ export const TOOL_DEFINITIONS: Anthropic.Tool[] = [
           description: "One or two sentences on what the customer needs.",
         },
       },
-      required: ["kind", "slot_start", "issue_summary"],
+      required: ["kind", "slot", "issue_summary"],
     },
   },
   {
@@ -179,6 +180,95 @@ async function bookedStarts(
   return (data ?? []).map((row) => row.starts_at as string);
 }
 
+// Labels compare ignoring case and spacing, with any dash alike (hyphen, en
+// dash, em dash): "mon oct 5, 9 – 11 am" is "Mon Oct 5, 9-11 AM".
+function normalizeLabel(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[‐-―−]/g, "-")
+    .replace(/\s*-\s*/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const ISO_START = /^\d{4}-\d{2}-\d{2}T/;
+
+// The open slot a customer-facing time refers to: the label as it was offered,
+// or an ISO start time. Only ISO-shaped text is parsed as a date, because a
+// label like "Mon Oct 5, 9-11 AM" can parse to a nonsense date.
+function findSlot(open: Slot[], requested: string): Slot | undefined {
+  if (ISO_START.test(requested)) {
+    const wanted = Date.parse(requested);
+    return open.find((s) => Date.parse(s.start) === wanted);
+  }
+  const wanted = normalizeLabel(requested);
+  return open.find((s) => normalizeLabel(s.label) === wanted);
+}
+
+// An email that arrives after the booking still gets its confirmation: every
+// scheduled appointment on this lead that has no customer notification yet is
+// confirmed to the new address. Returns how many went out (logged counts, a
+// failed send does not). Lookup errors mean none are sent; they never fail the
+// save.
+async function sendMissingConfirmations(
+  ctx: ToolContext,
+  customerName: string,
+  to: string,
+): Promise<number> {
+  const { supabase, businessId, profile } = ctx;
+  const { data: appointments, error: appointmentError } = await supabase
+    .from("appointments")
+    .select("id, kind, starts_at")
+    .eq("lead_id", ctx.leadId)
+    .eq("business_id", businessId)
+    .eq("status", "scheduled")
+    .order("starts_at", { ascending: true });
+  if (appointmentError || !appointments || appointments.length === 0) {
+    if (appointmentError) console.error("[tools] confirmation lookup failed");
+    return 0;
+  }
+
+  const { data: existing, error: notificationError } = await supabase
+    .from("notifications")
+    .select("appointment_id")
+    .eq("business_id", businessId)
+    .eq("audience", "customer")
+    .in(
+      "appointment_id",
+      appointments.map((a) => a.id as string),
+    );
+  if (notificationError) {
+    console.error("[tools] confirmation lookup failed");
+    return 0;
+  }
+  const confirmed = new Set((existing ?? []).map((n) => n.appointment_id as string));
+
+  let sent = 0;
+  for (const appointment of appointments) {
+    if (confirmed.has(appointment.id as string)) continue;
+    const kind = appointment.kind as SlotKind;
+    const mail = bookingCustomerEmail({
+      kindLabel: kindLabel(kind),
+      slotLabel: slotLabel(kind, appointment.starts_at as string),
+      customerName,
+      businessName: businessName(profile),
+      isDemo: profile.is_demo === true,
+    });
+    const result = await sendEmail(supabase, {
+      businessId,
+      conversationId: ctx.conversationId,
+      leadId: ctx.leadId,
+      appointmentId: appointment.id as string,
+      audience: "customer",
+      to,
+      template: "booking_customer",
+      ...mail,
+    });
+    if (result.status !== "failed") sent++;
+  }
+  return sent;
+}
+
 async function getAvailableSlots(
   input: Record<string, unknown>,
   ctx: ToolContext,
@@ -237,7 +327,8 @@ async function saveCustomerDetails(
   if (findError) return fail(SAVE_FAILED);
 
   let customerId: string;
-  let email: string | null = existing?.email ?? null;
+  const previousEmail: string | null = existing?.email ?? null;
+  let email: string | null = previousEmail;
   if (existing) {
     const { error } = await supabase
       .from("customers")
@@ -305,7 +396,22 @@ async function saveCustomerDetails(
     .eq("business_id", businessId);
   if (leadError) return fail(SAVE_FAILED, wrote);
 
-  return done({ saved: true, has_address: hasAddress, has_email: Boolean(email) }, true);
+  // A newly saved (or changed) email also confirms bookings made earlier.
+  const emailChanged =
+    emailText !== "" && emailText.toLowerCase() !== (previousEmail ?? "").toLowerCase();
+  const confirmationsSent = emailChanged
+    ? await sendMissingConfirmations(ctx, name, emailText)
+    : 0;
+
+  return done(
+    {
+      saved: true,
+      has_address: hasAddress,
+      has_email: Boolean(email),
+      confirmations_sent: confirmationsSent,
+    },
+    true,
+  );
 }
 
 async function bookAppointment(
@@ -316,21 +422,18 @@ async function bookAppointment(
   if (!isKind(kind)) {
     return fail("kind must be service_visit, estimate_visit, or phone_call.");
   }
-  const slotStart = textOf(input.slot_start);
+  const requestedSlot = textOf(input.slot);
   const issue = textOf(input.issue_summary).slice(0, TEXT_MAX);
-  if (!slotStart || !issue) {
-    return fail("slot_start and issue_summary are required.");
+  if (!requestedSlot || !issue) {
+    return fail("slot and issue_summary are required.");
   }
   const { supabase, businessId, profile } = ctx;
 
-  // a. the requested instant must still be open
+  // a. the requested time must be one of the slots still open for this kind
   const slots = buildSlots(kind, ctx.now);
   const booked = await bookedStarts(ctx, kind, slots);
   if (!booked) return fail(BOOKING_FAILED);
-  const wanted = new Date(slotStart).getTime();
-  const slot = openSlots(slots, booked).find(
-    (s) => new Date(s.start).getTime() === wanted,
-  );
+  const slot = findSlot(openSlots(slots, booked), requestedSlot);
   if (!slot) return fail(SLOT_UNAVAILABLE);
 
   // b-d. what must be on file before this lead can hold this appointment

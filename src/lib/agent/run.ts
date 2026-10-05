@@ -285,8 +285,8 @@ export async function processInbound(
         // call that has to produce the reply.
         for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
           // The call gets what is left of the run's budget, minus 2 s so the
-          // reply can still be stored and sent. With under 10 s left there is
-          // no time for a retry.
+          // reply can still be stored and sent. With under 10 s of call time
+          // left (remaining minus that 2 s) there is no time for a retry.
           const remaining = RUN_DEADLINE_MS - (Date.now() - a.receivedAt);
           if (remaining - 2000 <= 0) {
             failure = "deadline";
@@ -307,7 +307,7 @@ export async function processInbound(
               },
               {
                 timeout: Math.min(CLAUDE_TIMEOUT_MS, remaining - 2000),
-                maxRetries: remaining < 10000 ? 0 : 1,
+                maxRetries: remaining - 2000 < 10000 ? 0 : 1,
               },
             );
           } catch (err) {

@@ -9,6 +9,7 @@ import {
   BUSINESS_NUMBER,
   CUSTOMER_NUMBER,
   SCENARIOS,
+  bookingTurn,
   isSimulated,
   type Ended,
   type Scenario,
@@ -53,6 +54,7 @@ type RunResult = {
   inputTokens: number; // the agent's own tokens; the simulated customer's are not counted
   outputTokens: number;
   turnsUsed: number; // customer texts sent to the agent
+  turnsToBooking: number | null; // the customer turn whose run booked, or null
   ended: Ended;
   trace: Trace;
 };
@@ -263,6 +265,7 @@ async function main() {
       inputTokens: turns.reduce((n, t) => n + (t.inputTokens ?? 0), 0),
       outputTokens: turns.reduce((n, t) => n + (t.outputTokens ?? 0), 0),
       turnsUsed: turns.length,
+      turnsToBooking: bookingTurn(trace),
       ended,
       trace,
     };
@@ -289,6 +292,7 @@ async function main() {
           inputTokens: 0,
           outputTokens: 0,
           turnsUsed: 0,
+          turnsToBooking: null,
           ended: "no_reply",
           trace: { turns: [], ended: "no_reply", tables: {} },
         });
@@ -316,6 +320,7 @@ async function main() {
       title: scenario.title,
       passed: `${runs.filter((r) => r.passed).length}/${runs.length}`,
       turns: runs.map((r) => r.turnsUsed).join(","),
+      booking: runs.map((r) => (r.turnsToBooking === null ? "-" : String(r.turnsToBooking))).join(","),
       ms: String(sum(runs, (r) => r.ms)),
       tokens: `${sum(runs, (r) => r.inputTokens)}/${sum(runs, (r) => r.outputTokens)}`,
       failed,
@@ -326,6 +331,7 @@ async function main() {
     title: "Scenario",
     passed: "Passed",
     turns: "Turns per run",
+    booking: "Turns to booking",
     ms: "Total ms",
     tokens: "Agent tokens in/out",
     failed: "Failed checks",
@@ -398,6 +404,7 @@ async function main() {
             inputTokens: r.inputTokens,
             outputTokens: r.outputTokens,
             turnsUsed: r.turnsUsed,
+            turnsToBooking: r.turnsToBooking,
             ended: r.ended,
             turns: r.trace.turns,
             tables: r.trace.tables,

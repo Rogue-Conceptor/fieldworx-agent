@@ -90,6 +90,15 @@ const scheduled = (t: Trace, kind: string): Row[] =>
 const noVisitAppointment = (t: Trace): boolean =>
   !t.tables.appointments.some((a) => VISIT_KINDS.includes(a.kind));
 
+// The customer turn (1-based) whose run made a successful book_appointment, or
+// null when nothing was booked.
+export function bookingTurn(t: Trace): number | null {
+  const i = t.turns.findIndex((turn) =>
+    turn.toolCalls.some((c) => c.name === "book_appointment" && c.ok),
+  );
+  return i === -1 ? null : i + 1;
+}
+
 // The simulated customer said DONE (so the conversation reached its goal or a
 // clean stop), after sending at most `n` texts to the agent.
 const finishedWithin = (n: number): Check => ({
@@ -264,6 +273,10 @@ const SCENARIO_LIST: Scenario[] = [
         description: 'reply contains "?"',
         test: (t) => finalReply(t).includes("?"),
       },
+      {
+        description: 'turn 1 reply contains "email"',
+        test: (t) => (t.turns[0].reply ?? "").toLowerCase().includes("email"),
+      },
     ],
   },
   {
@@ -272,7 +285,8 @@ const SCENARIO_LIST: Scenario[] = [
     seed: { customer: { name: "Alex Kim", email: null, location: "7 Pine St, 75043" } },
     opening: "My AC needs a repair visit, it stopped cooling this morning, no one vulnerable",
     persona: {
-      facts: "name Alex Kim, address on file, no email",
+      facts:
+        "name Alex Kim, address on file, no email, your address is 7 Pine St, ZIP 75043, and it is still correct",
       goal: "get a repair visit booked",
     },
     maxTurns: 8,
@@ -281,15 +295,75 @@ const SCENARIO_LIST: Scenario[] = [
         description: "a scheduled service_visit appointment exists",
         test: (t) => scheduled(t, "service_visit").length > 0,
       },
-      finishedWithin(3),
+      {
+        description: "turns to booking <= 3",
+        test: (t) => {
+          const n = bookingTurn(t);
+          return n !== null && n <= 3;
+        },
+      },
       {
         description: "the run that booked made at most 2 tool calls",
         test: (t) => {
-          const booking = t.turns.find((turn) =>
-            turn.toolCalls.some((c) => c.name === "book_appointment" && c.ok),
-          );
-          return booking !== undefined && booking.toolCalls.length <= 2;
+          const n = bookingTurn(t);
+          return n !== null && t.turns[n - 1].toolCalls.length <= 2;
         },
+      },
+      {
+        description: "no successful save_customer_details call anywhere in the scenario",
+        test: (t) => !allCalls(t).some((c) => c.name === "save_customer_details" && c.ok),
+      },
+    ],
+  },
+  {
+    id: "11",
+    title: "moved-address",
+    seed: { customer: { name: "Alex Kim", email: null, location: "7 Pine St, 75043" } },
+    opening: "My AC needs a repair visit, it stopped cooling this morning, no one vulnerable",
+    persona: {
+      facts: "name Alex Kim, you moved last month, new address 22 Cedar Ave, ZIP 75044, no email",
+      goal: "get a repair visit at your new address — when asked to confirm your address, say you moved and give the new one",
+    },
+    maxTurns: 8,
+    checks: [
+      {
+        description: "a scheduled service_visit appointment exists",
+        test: (t) => scheduled(t, "service_visit").length > 0,
+      },
+      {
+        description: 'its work order\'s service location address contains "22 Cedar Ave"',
+        test: (t) =>
+          scheduled(t, "service_visit").some((a) => {
+            const order = t.tables.work_orders.find((w) => w.id === a.work_order_id);
+            const location = t.tables.service_locations.find(
+              (l) => l.id === order?.service_location_id,
+            );
+            return String(location?.address ?? "").includes("22 Cedar Ave");
+          }),
+      },
+    ],
+  },
+  {
+    id: "12",
+    title: "email-after-booking",
+    opening: "My AC is blowing warm air",
+    persona: {
+      facts:
+        "name Jane Doe, address 12 Elm St, ZIP 75043, started yesterday, 80 degrees inside, nobody vulnerable, email jane.doe@example.com — give the email only if asked for it",
+      goal: "get a repair visit booked, and accept an email confirmation if offered",
+    },
+    maxTurns: 8,
+    checks: [
+      {
+        description: "a scheduled service_visit appointment exists",
+        test: (t) => scheduled(t, "service_visit").length > 0,
+      },
+      {
+        description: 'a notifications row with audience "customer" and template "booking_customer" exists',
+        test: (t) =>
+          t.tables.notifications.some(
+            (n) => n.audience === "customer" && n.template === "booking_customer",
+          ),
       },
     ],
   },
