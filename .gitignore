@@ -31,6 +31,9 @@ yarn-error.log*
 # vercel
 .vercel
 
+# eval harness traces
+scripts/eval/out/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

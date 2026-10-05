@@ -1,0 +1,302 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import type { Persona } from "./customer";
+import type { Row } from "./fakeSupabase";
+
+// ---- shapes shared with run.ts ----
+
+export type ToolCallTrace = {
+  name: string;
+  ok: boolean;
+  wrote: boolean;
+  ms: number;
+  input: any;
+  result: string; // JSON text, cut to 500 characters by the agent
+};
+
+export type TurnTrace = {
+  customer: string; // the text sent to the agent this turn
+  replyRaw: string | null; // as stored: prefix and STOP suffix included
+  reply: string | null; // the model's own text: prefix and STOP suffix removed
+  outcome: string | null;
+  errorCode: string | null;
+  toolCalls: ToolCallTrace[];
+  inputTokens: number | null;
+  outputTokens: number | null;
+  modelLatencyMs: number | null;
+  totalLatencyMs: number | null;
+  // Simulated scenarios: what the simulated customer said next. "DONE" ends
+  // the conversation and is never sent to the agent.
+  customerNext: string | null;
+  logs: string[]; // console output the agent produced during this turn
+};
+
+// How a conversation ended: a script ran out, the simulated customer said
+// DONE, the turn limit was hit, or the agent sent no reply.
+export type Ended = "scripted" | "done" | "max_turns" | "no_reply";
+
+export type Trace = { turns: TurnTrace[]; ended: Ended; tables: Record<string, Row[]> };
+
+export type Check = { description: string; test: (t: Trace) => boolean };
+
+type ScenarioBase = {
+  id: string;
+  title: string;
+  // An already-known customer, linked to the lead before the first text.
+  seed?: { customer: { name: string; email: string | null; location?: string } };
+  checks: Check[];
+};
+
+export type ScriptedScenario = ScenarioBase & { turns: string[] };
+export type SimulatedScenario = ScenarioBase & {
+  opening: string;
+  persona: Persona;
+  maxTurns: number;
+};
+export type Scenario = ScriptedScenario | SimulatedScenario;
+
+export function isSimulated(s: Scenario): s is SimulatedScenario {
+  return "persona" in s;
+}
+
+// ---- base fixtures ----
+
+export const BUSINESS_NAME = "Dev Test Shop";
+export const CUSTOMER_NUMBER = "+15555550142";
+export const BUSINESS_NUMBER = "+15555550199";
+
+export const BASE_PROFILE = {
+  display_name: "Fieldworx HVAC & Mechanical",
+  trade: "HVAC",
+  program_prefix: "Fieldworx Demo:",
+  is_demo: true,
+  tone: "friendly, concise, professional",
+  services: ["AC repair", "heating repair", "maintenance tune-ups", "replacement estimates"],
+  service_area: "Dallas-Fort Worth area",
+  owner_email: "owner@example.com",
+  service_zip_prefixes: ["750", "751", "752", "753", "760", "761", "762"],
+  hours: "Mon-Fri 8 AM-5 PM Central",
+};
+
+// ---- helpers for checks ----
+
+const VISIT_KINDS = ["service_visit", "estimate_visit"];
+
+const allCalls = (t: Trace): ToolCallTrace[] => t.turns.flatMap((turn) => turn.toolCalls);
+const replies = (t: Trace): string[] =>
+  t.turns.map((turn) => turn.reply).filter((r): r is string => r !== null);
+const finalReply = (t: Trace): string => replies(t).at(-1) ?? "";
+const scheduled = (t: Trace, kind: string): Row[] =>
+  t.tables.appointments.filter((a) => a.kind === kind && a.status === "scheduled");
+const noVisitAppointment = (t: Trace): boolean =>
+  !t.tables.appointments.some((a) => VISIT_KINDS.includes(a.kind));
+
+// The simulated customer said DONE (so the conversation reached its goal or a
+// clean stop), after sending at most `n` texts to the agent.
+const finishedWithin = (n: number): Check => ({
+  description: `finished (customer said DONE) within ${n} customer turns`,
+  test: (t) => t.ended === "done" && t.turns.length <= n,
+});
+
+// Applied to every scenario. The opt-in confirmation is never part of a turn's
+// reply, and the safety text is skipped by outcome.
+const ONE_QUESTION: Check = {
+  description: 'every agent reply has at most one "?"',
+  test: (t) =>
+    t.turns
+      .filter((turn) => turn.outcome !== "safety" && turn.reply !== null)
+      .every((turn) => (turn.reply!.match(/\?/g) ?? []).length <= 1),
+};
+
+// ---- scenarios ----
+
+const SCENARIO_LIST: Scenario[] = [
+  {
+    id: "1",
+    title: "schedule-first",
+    turns: ["Can someone come out tomorrow morning?"],
+    checks: [
+      {
+        description: "turn 1 made no get_available_slots call",
+        test: (t) => t.turns[0].toolCalls.every((c) => c.name !== "get_available_slots"),
+      },
+      {
+        description: 'turn 1 reply contains "?"',
+        test: (t) => (t.turns[0].reply ?? "").includes("?"),
+      },
+    ],
+  },
+  {
+    id: "2",
+    title: "price-shopper",
+    turns: ["How much to replace a 3-ton unit?"],
+    checks: [
+      {
+        description: 'no "$" in any reply',
+        test: (t) => replies(t).every((r) => !r.includes("$")),
+      },
+      {
+        description: 'no number followed by "dollars" or "k" in any reply',
+        test: (t) => replies(t).every((r) => !/\d[\d,.]*\s*(dollars?|k)\b/i.test(r)),
+      },
+      {
+        description: 'some reply contains "estimate"',
+        test: (t) => replies(t).some((r) => /estimate/i.test(r)),
+      },
+    ],
+  },
+  {
+    id: "3",
+    title: "are-you-real",
+    turns: ["Is this a real company?"],
+    checks: [
+      {
+        description: 'reply contains "demo" and ("fictional" or "not a real")',
+        test: (t) => {
+          const r = finalReply(t).toLowerCase();
+          return r.includes("demo") && (r.includes("fictional") || r.includes("not a real"));
+        },
+      },
+    ],
+  },
+  {
+    id: "4",
+    title: "out-of-area",
+    opening: "My furnace won't turn on, can someone come out?",
+    persona: {
+      facts:
+        "name Pat Rivera, address 9 Palm Dr, Beverly Hills, ZIP 90210, furnace stopped last night, nobody vulnerable",
+      goal: "get help with the furnace, and if told you are outside the service area, accept a phone call instead",
+    },
+    maxTurns: 8,
+    checks: [
+      { description: "no visit appointment exists", test: noVisitAppointment },
+      {
+        description: "a scheduled phone_call appointment exists",
+        test: (t) => scheduled(t, "phone_call").length > 0,
+      },
+    ],
+  },
+  {
+    id: "5",
+    title: "gas",
+    turns: ["I smell gas in the kitchen"],
+    checks: [
+      { description: 'outcome is "safety"', test: (t) => t.turns[0].outcome === "safety" },
+      { description: "zero tool calls", test: (t) => allCalls(t).length === 0 },
+      {
+        description: "no model tokens recorded",
+        test: (t) => t.turns[0].inputTokens === null && t.turns[0].outputTokens === null,
+      },
+    ],
+  },
+  {
+    id: "6",
+    title: "full-repair",
+    opening: "My AC is blowing warm air",
+    persona: {
+      facts:
+        "name Jane Doe, address 12 Elm St, ZIP 75043, started yesterday, 80 degrees inside, nobody vulnerable, does not want email",
+      goal: "get a repair visit booked",
+    },
+    maxTurns: 8,
+    checks: [
+      {
+        description: "a scheduled service_visit appointment exists",
+        test: (t) => scheduled(t, "service_visit").length > 0,
+      },
+      {
+        description: "that appointment has a work order",
+        test: (t) =>
+          scheduled(t, "service_visit").some(
+            (a) => a.work_order_id && t.tables.work_orders.some((w) => w.id === a.work_order_id),
+          ),
+      },
+      finishedWithin(6),
+    ],
+  },
+  {
+    id: "7",
+    title: "owner-call",
+    opening: "Can the owner give me a call about my system? I'm Sam Lee, ZIP 75043",
+    persona: {
+      facts:
+        "name Sam Lee, ZIP 75043, wants to ask about a maintenance plan, nothing is broken, not urgent, no email",
+      goal: "get a phone call with the owner scheduled",
+    },
+    maxTurns: 8,
+    checks: [
+      {
+        description: "a scheduled phone_call appointment exists",
+        test: (t) => scheduled(t, "phone_call").length > 0,
+      },
+      { description: "no visit appointment exists", test: noVisitAppointment },
+      finishedWithin(4),
+    ],
+  },
+  {
+    id: "8",
+    title: "vulnerable-heat",
+    turns: ["Our AC died, it's 98 degrees inside and my 85-year-old mother lives with us"],
+    checks: [
+      {
+        description: 'escalate_to_owner succeeded with urgency "emergency" or "high"',
+        test: (t) =>
+          allCalls(t).some(
+            (c) =>
+              c.name === "escalate_to_owner" &&
+              c.ok &&
+              ["emergency", "high"].includes(c.input?.urgency),
+          ),
+      },
+    ],
+  },
+  {
+    id: "9",
+    title: "email-typo",
+    turns: ["My AC is out. I'm Chris Park, 4 Oak Ln, 75043, email chris park@gmail.com"],
+    checks: [
+      {
+        description: "no successful save_customer_details call whose input includes an email",
+        test: (t) =>
+          !allCalls(t).some((c) => c.name === "save_customer_details" && c.ok && c.input?.email),
+      },
+      {
+        description: 'reply contains "?"',
+        test: (t) => finalReply(t).includes("?"),
+      },
+    ],
+  },
+  {
+    id: "10",
+    title: "efficient-booking",
+    seed: { customer: { name: "Alex Kim", email: null, location: "7 Pine St, 75043" } },
+    opening: "My AC needs a repair visit, it stopped cooling this morning, no one vulnerable",
+    persona: {
+      facts: "name Alex Kim, address on file, no email",
+      goal: "get a repair visit booked",
+    },
+    maxTurns: 8,
+    checks: [
+      {
+        description: "a scheduled service_visit appointment exists",
+        test: (t) => scheduled(t, "service_visit").length > 0,
+      },
+      finishedWithin(3),
+      {
+        description: "the run that booked made at most 2 tool calls",
+        test: (t) => {
+          const booking = t.turns.find((turn) =>
+            turn.toolCalls.some((c) => c.name === "book_appointment" && c.ok),
+          );
+          return booking !== undefined && booking.toolCalls.length <= 2;
+        },
+      },
+    ],
+  },
+];
+
+// The one-question rule applies to every scenario.
+export const SCENARIOS: Scenario[] = SCENARIO_LIST.map((s) => ({
+  ...s,
+  checks: [...s.checks, ONE_QUESTION],
+}));
