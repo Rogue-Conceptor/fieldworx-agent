@@ -86,9 +86,61 @@ function predicatesFromOr(expr: string): Predicate[] {
   });
 }
 
+// One insert/update/delete attempt: what was written and the error code (or
+// message) if it failed.
+export type WriteLogEntry = {
+  table: string;
+  op: "insert" | "update" | "delete";
+  payload: any;
+  error: string | null;
+};
+
 export class FakeSupabase {
   tables: Record<string, Row[]> = Object.fromEntries(TABLES.map((t) => [t, [] as Row[]]));
   private lastTimestamp = 0;
+
+  // ---- optional test hooks (the eval harness does not use any of these) ----
+
+  // Every insert/update/delete attempt, in order, failed ones included.
+  log: WriteLogEntry[] = [];
+  private forcedFailures: { table: string; op: string; error: DbError }[] = [];
+  private insertHooks = new Map<string, (input: Row) => void>();
+
+  // The next `op` on `table` fails with `error` and changes nothing.
+  failNext(table: string, op: "insert" | "update" | "delete", error: DbError): void {
+    this.forcedFailures.push({ table, op, error });
+  }
+
+  // Runs once, just before the next insert into `table` is built and checked:
+  // a way to have another writer get in first.
+  beforeNextInsert(table: string, hook: (input: Row) => void): void {
+    this.insertHooks.set(table, hook);
+  }
+
+  takeForcedFailure(table: string, op: string): DbError | null {
+    const i = this.forcedFailures.findIndex((f) => f.table === table && f.op === op);
+    return i === -1 ? null : this.forcedFailures.splice(i, 1)[0].error;
+  }
+
+  takeInsertHook(table: string): ((input: Row) => void) | undefined {
+    const hook = this.insertHooks.get(table);
+    this.insertHooks.delete(table);
+    return hook;
+  }
+
+  recordWrite(
+    table: string,
+    op: "insert" | "update" | "delete",
+    payload: any,
+    error: DbError | null,
+  ): void {
+    this.log.push({
+      table,
+      op,
+      payload: structuredClone(payload),
+      error: error ? (error.code ?? error.message) : null,
+    });
+  }
 
   from(table: string): Query {
     if (!this.tables[table]) throw new Error(`fakeSupabase: unknown table "${table}"`);
@@ -268,16 +320,27 @@ class Query {
       return { data: found.map((r) => this.project(r)), error: null };
     }
 
+    // A failure queued with failNext() hits the next matching write.
+    const forced = db.takeForcedFailure(table, this.op);
+    if (forced) {
+      db.recordWrite(table, this.op, this.payload, forced);
+      return { data: null, error: forced };
+    }
+
     if (this.op === "insert") {
       const inserted: Row[] = [];
       for (const input of Array.isArray(this.payload) ? this.payload : [this.payload]) {
+        db.takeInsertHook(table)?.(input);
         const row = db.build(table, input);
         if (table === "appointments" && db.scheduledSlotTaken(row)) {
-          return { data: null, error: { ...UNIQUE_VIOLATION } };
+          const error = { ...UNIQUE_VIOLATION };
+          db.recordWrite(table, "insert", this.payload, error);
+          return { data: null, error };
         }
         rows.push(row);
         inserted.push(row);
       }
+      db.recordWrite(table, "insert", this.payload, null);
       return { data: this.returning ? inserted.map((r) => this.project(r)) : null, error: null };
     }
 
@@ -291,17 +354,21 @@ class Query {
         if (table === "appointments") {
           next.resource = next.kind === "phone_call" ? "call" : "visit";
           if (db.scheduledSlotTaken(next, row.id)) {
-            return { data: null, error: { ...UNIQUE_VIOLATION } };
+            const error = { ...UNIQUE_VIOLATION };
+            db.recordWrite(table, "update", this.payload, error);
+            return { data: null, error };
           }
         }
         if (HAS_UPDATED_AT.has(table)) next.updated_at = db.nextTimestamp();
         Object.assign(row, next);
       }
+      db.recordWrite(table, "update", this.payload, null);
       return { data: this.returning ? hit.map((r) => this.project(r)) : null, error: null };
     }
 
     const hit = rows.filter((r) => this.matches(r));
     db.tables[table] = rows.filter((r) => !hit.includes(r));
+    db.recordWrite(table, "delete", { deleted: hit.length }, null);
     return { data: this.returning ? hit.map((r) => this.project(r)) : null, error: null };
   }
 
