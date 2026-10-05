@@ -1,7 +1,7 @@
 # Fieldworx Demo — A2P 10DLC Registration Package
 
-> **Version:** v1.4
-> **Last updated:** 2026-10-03 — brand APPROVED; Messaging Service created; campaign SUBMITTED, in review.
+> **Version:** v1.5
+> **Last updated:** 2026-10-04 — privacy page updated twice after submission (retention wording; data collected on booking, Resend); retention job live.
 > **Versioning:** Bump when any field, page, or decision changes. After submission, log every rejection code and the fix here.
 
 **What this file is:** Everything needed to register the Fieldworx demo number for US carrier texting, in submission order. Every field is written to pass review on the first try. Items in `[BRACKETS]` need your input before use.
@@ -10,6 +10,7 @@
 
 ## Changelog
 
+- **v1.5** (2026-10-04) — Live privacy page changed after campaign submission, recorded here so the package matches the site: (1) DATA RETENTION now reads "deleted from our systems within 30 days of the first message; service providers may retain records under their own policies" (Twilio's own message logs are not purged by us — decision: narrow the wording rather than build Twilio-side deletion); (2) INFORMATION WE COLLECT, HOW WE USE IT, SERVICE PROVIDERS, DATA RETENTION updated for booking (name, address, ZIP, optional email), Resend as email provider, and retention covering bookings. Rule 7 (30-day deletion) is now BUILT: migrations #5/#6, nightly pg_cron job, first live purge 2026-10-04.
 - **v1.4** (2026-10-03) — Brand approved (OTP answered). Messaging Service "Fieldworx Demo" created: number in sender pool, defers to the number's own webhook, YES removed from opt-in keywords (START, UNSTOP remain). Campaign submitted. Changes from the package text at submission: opt-in method = Verbal (only option offered); opt-in message added (fixed confirmation, Section 4.5). New code commitment: rule 8 (opt-in confirmation on new conversations) — built and verified in commit eb7c458.
 - **v1.3** (2026-10-03) — Brand submitted in the Fieldworx subaccount; status: in review. Twilio would not accept "Fieldworx Demo" as the brand name — Sole Proprietor brands default to the individual's legal name. No campaign changes needed: campaign text and pages already tie Fieldworx Demo to Jerry King (same pattern as Beacon's original approved sole-proprietor campaign). Messaging Service to be created during campaign registration.
 - **v1.2** (2026-10-03) — Three pages published and verified by direct fetch: text matches v1.1, all NOINDEX, none in navigation. All campaign-field URLs changed from `https://jerrster.com/` to `https://www.jerrster.com/` to match the live pages exactly. Open item: site footer links to Beacon's policies on Fieldworx pages.
@@ -154,7 +155,7 @@ What we submit is a promise; the agent has to keep it. These go into the system 
 | 4 | Gas smell, burning smell, smoke, carbon monoxide → safety reply first, nothing else | System prompt + code keyword backstop |
 | 5 | No marketing, no promotions, no links | System prompt |
 | 6 | Never claim to be a real company or promise a real technician | System prompt |
-| 7 | Delete demo conversations after `30` days | Code — a scheduled cleanup (**NOT BUILT — blocker before sharing the number**) |
+| 7 | Delete demo conversations (and everything created from them) within 30 days of the first message | Code — `private.purge_demo_data()` nightly via pg_cron; **built and verified 2026-10-04** |
 | 8 | First message of a new conversation is the exact registered opt-in confirmation | Code — built in commit eb7c458, verified live in log mode |
 
 ---

@@ -1,7 +1,7 @@
 # Fieldworx Agent — Product Spec
 
-> **Version:** v1.0
-> **Last updated:** Session — initial creation.
+> **Version:** v1.1
+> **Last updated:** 2026-10-04 — goal reframed to showcase-first; tool set, email confirmations, A2P per-tenant reality, retention as product behavior.
 > **Versioning:** Bump on meaningful change and log below. This doc changes rarely — only when a product decision, architecture principle, or scope item actually changes. Day-to-day build progress does NOT belong here (that's BUILD_STATE.md).
 
 **What this file is:** The stable "what we're building and why" reference. Changes rarely. For *where the build is*, see BUILD_STATE.md.
@@ -10,6 +10,7 @@
 
 ## Changelog
 
+- **v1.1** (2026-10-04) — Product decisions recorded: showcase-for-employers is the first goal (revenue later, same codebase); agent actions v1 and v1.1; email confirmations; agent never texts first (A2P campaign constraint); each production tenant needs its own A2P registration (ISV onboarding); demo data retention is a product behavior; demo persona carries a visible demo disclosure.
 - **v1.0** — Initial creation. Captures product summary, agent-vs-workflow thesis, architecture principles (multi-tenant, two-layer schema, Model B lead entity, work-order-links-to-lead, append-only audit, routing-vs-RLS), planned v1 tools, locked product decisions, data/IP constraints, business context.
 
 ---
@@ -47,7 +48,29 @@ Routing (matching an inbound `To` number to a business) is app-level logic in th
 
 ---
 
-## Planned agent tools (v1)
+## Goal (as of 2026-10-04)
+
+**First: a showcase.** A live, texted demo that proves agent-building skill to employers — real phone number, real replies, real bookings and email, with the reasoning visible in a trace viewer. **Later: the business** described below, on the same codebase. Multi-tenancy and the EasyHVAC-aligned schema stay first-class so the later path needs no rewrite.
+
+## Agent actions — decided
+
+| Version | Actions |
+|---|---|
+| v1 (built) | book service visit · book estimate visit (someone comes out to price; the agent never quotes) · schedule phone call with the owner · check service area · save customer details · escalate to owner · answer shop facts from the profile |
+| v1.1 (approved) | find my appointments · reschedule · cancel |
+| Excluded for now | reminders, review requests, follow-ups, re-engagement — anything where the agent texts first. The registered campaign promises the assistant never starts a conversation. |
+
+**Confirmations:** the owner gets an email for every booking and escalation; the customer gets one if they give an email (optional; asked once). Emails come from a verified sending domain.
+
+**Design rule:** the model chooses; code decides what is allowed. Tools receive business, caller, and conversation from the run, never from the model, and validate everything before writing.
+
+## Compliance as product
+
+- **A2P 10DLC:** carriers block unregistered business texting. The demo is registered as a sole-proprietor brand with one campaign. **In production, each tenant business is its own brand** — Fieldworx registers each customer as a software vendor (ISV), with days-to-weeks lead time per customer. Onboarding and the pilot pitch must account for this.
+- **Retention:** demo data (conversations and everything created from them) is deleted within 30 days of the first message. Real tenants will get their own retention setting; a demo rule must never delete a paying shop's history.
+- **Disclosure:** the demo persona ("Fieldworx HVAC & Mechanical") is fictional; every text carries the `Fieldworx Demo:` prefix, and bookings say no technician will come.
+
+## Planned agent tools (v1, original list)
 
 - `check_calendar` — owner availability
 - `book_appointment` — calendar event + work order
