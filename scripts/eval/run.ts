@@ -55,6 +55,7 @@ type RunResult = {
   outputTokens: number;
   turnsUsed: number; // customer texts sent to the agent
   turnsToBooking: number | null; // the customer turn whose run booked, or null
+  questionsTrimmed: number; // extra questions the guardrail cut, across the run
   ended: Ended;
   trace: Trace;
 };
@@ -152,6 +153,7 @@ async function main() {
 
       // The agent's own log lines are kept with the turn instead of printed.
       const logs: string[] = [];
+      let questionsTrimmed = 0;
       const original = { log: console.log, error: console.error, warn: console.warn };
       const capture = (...args: unknown[]) => {
         logs.push(
@@ -174,7 +176,13 @@ async function main() {
             conversationIsNew: turns.length === 0,
             receivedAt: Date.now(),
           },
-          { supabase: db as never, anthropic: client },
+          {
+            supabase: db as never,
+            anthropic: client,
+            onEvent: (e) => {
+              if (e.type === "question_trimmed") questionsTrimmed += e.dropped;
+            },
+          },
         );
       } finally {
         console.log = original.log;
@@ -208,6 +216,7 @@ async function main() {
         modelLatencyMs: agentRun?.model_latency_ms ?? null,
         totalLatencyMs: agentRun?.total_latency_ms ?? null,
         customerNext: null,
+        questionsTrimmed,
         logs,
       };
       turns.push(turn);
@@ -266,6 +275,7 @@ async function main() {
       outputTokens: turns.reduce((n, t) => n + (t.outputTokens ?? 0), 0),
       turnsUsed: turns.length,
       turnsToBooking: bookingTurn(trace),
+      questionsTrimmed: turns.reduce((n, t) => n + t.questionsTrimmed, 0),
       ended,
       trace,
     };
@@ -293,6 +303,7 @@ async function main() {
           outputTokens: 0,
           turnsUsed: 0,
           turnsToBooking: null,
+          questionsTrimmed: 0,
           ended: "no_reply",
           trace: { turns: [], ended: "no_reply", tables: {} },
         });
@@ -321,6 +332,8 @@ async function main() {
       passed: `${runs.filter((r) => r.passed).length}/${runs.length}`,
       turns: runs.map((r) => r.turnsUsed).join(","),
       booking: runs.map((r) => (r.turnsToBooking === null ? "-" : String(r.turnsToBooking))).join(","),
+      // Extra questions cut by the guardrail, and how many runs had any.
+      trims: `${sum(runs, (r) => r.questionsTrimmed)} (${runs.filter((r) => r.questionsTrimmed > 0).length}/${runs.length} runs)`,
       ms: String(sum(runs, (r) => r.ms)),
       tokens: `${sum(runs, (r) => r.inputTokens)}/${sum(runs, (r) => r.outputTokens)}`,
       failed,
@@ -332,6 +345,7 @@ async function main() {
     passed: "Passed",
     turns: "Turns per run",
     booking: "Turns to booking",
+    trims: "Q-trims",
     ms: "Total ms",
     tokens: "Agent tokens in/out",
     failed: "Failed checks",
@@ -405,6 +419,7 @@ async function main() {
             outputTokens: r.outputTokens,
             turnsUsed: r.turnsUsed,
             turnsToBooking: r.turnsToBooking,
+            questionsTrimmed: r.questionsTrimmed,
             ended: r.ended,
             turns: r.trace.turns,
             tables: r.trace.tables,

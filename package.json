@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "eval": "tsx --env-file=.env.local --conditions=react-server scripts/eval/run.ts"
+    "eval": "tsx --env-file=.env.local --conditions=react-server scripts/eval/run.ts",
+    "test:unit": "tsx --conditions=react-server scripts/tests/unit.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0",

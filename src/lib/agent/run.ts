@@ -12,7 +12,7 @@ import {
 } from "./config";
 import type { SlotKind } from "./clock";
 import { kindLabel } from "./emails";
-import { formatOutbound } from "./format";
+import { formatOutbound, formatOutboundWithInfo } from "./format";
 import { loadHistory } from "./history";
 import {
   classifyInbound,
@@ -175,11 +175,15 @@ function bookingConfirmation(
 }
 
 // Never throws: any unexpected failure is logged (masked) and recorded as an
-// "error" run when possible. `deps` lets a test inject its own clients; left
-// out, the real ones are used.
+// "error" run when possible. `deps` lets a test inject its own clients and
+// listen for events; left out, the real clients are used and events are ignored.
 export async function processInbound(
   a: ProcessInboundArgs,
-  deps?: { supabase?: Admin; anthropic?: Pick<Anthropic, "messages"> },
+  deps?: {
+    supabase?: Admin;
+    anthropic?: Pick<Anthropic, "messages">;
+    onEvent?: (e: { type: "question_trimmed"; dropped: number }) => void;
+  },
 ): Promise<void> {
   // Declared outside the try so an error run still records the tools that ran.
   const toolCalls: ToolCallRecord[] = [];
@@ -418,7 +422,13 @@ export async function processInbound(
         }
       } else {
         outcome = "replied";
-        replyText = formatOutbound(modelText, prefix);
+        // The one-question rule is enforced here, not just asked of the model.
+        const formatted = formatOutboundWithInfo(modelText, prefix);
+        replyText = formatted.body;
+        if (formatted.questionsDropped > 0) {
+          console.log(`[agent] trimmed ${formatted.questionsDropped} extra question(s)`);
+          deps?.onEvent?.({ type: "question_trimmed", dropped: formatted.questionsDropped });
+        }
       }
 
       // 4. a newer inbound message means this reply is stale, unless a tool

@@ -34,6 +34,76 @@ const SAFETY_PHRASES = [
   "on fire",
 ];
 
+// A safety phrase is denied ("no smoke") when one of these words comes before
+// it in the same clause.
+const NEGATORS = new Set([
+  "no",
+  "not",
+  "don't",
+  "dont",
+  "doesn't",
+  "doesnt",
+  "didn't",
+  "didnt",
+  "isn't",
+  "isnt",
+  "aren't",
+  "arent",
+  "wasn't",
+  "wasnt",
+  "never",
+  "nothing",
+  "without",
+  "none",
+]);
+
+// Start of the longest safety phrase that `text` ends with, or -1.
+function phraseStartEndingText(text: string): number {
+  let start = -1;
+  let longest = 0;
+  for (const phrase of SAFETY_PHRASES) {
+    if (phrase.length > longest && text.endsWith(phrase)) {
+      start = text.length - phrase.length;
+      longest = phrase.length;
+    }
+  }
+  return start;
+}
+
+// Is the safety phrase that starts at `at` in this clause denied? Only if
+//  (a) a negator is one of the two words right before it ("no smoke",
+//      "don't smell gas"), or
+//  (b) it continues a denied phrase with "or" / "nor" ("no burning smell or
+//      smoke": "smoke" is denied because "burning smell" is).
+// A negator any further back does not count, so "no heat and I smell gas"
+// still alarms.
+function isNegatedAt(clause: string, at: number): boolean {
+  const before = clause.slice(0, at);
+  const words = before.match(/[a-z']+/g) ?? [];
+  if (words.slice(-2).some((word) => NEGATORS.has(word))) return true;
+
+  const joiner = /\s(?:or|nor)\s+$/.exec(before);
+  if (joiner) {
+    const previous = phraseStartEndingText(before.slice(0, joiner.index).trimEnd());
+    if (previous !== -1) return isNegatedAt(clause, previous);
+  }
+  return false;
+}
+
+// A clause is a live alarm if any safety phrase in it is not denied.
+function hasLiveSafetyPhrase(clause: string): boolean {
+  return SAFETY_PHRASES.some((phrase) => {
+    for (let at = clause.indexOf(phrase); at !== -1; at = clause.indexOf(phrase, at + 1)) {
+      if (!isNegatedAt(clause, at)) return true;
+    }
+    return false;
+  });
+}
+
+// Clauses break at punctuation and at " but ", " though ", " however " and
+// " and ", so a denial never reaches across to a different statement.
+const CLAUSE_BREAK = /[,.;:!?]|\s(?:but|though|however|and)\s/;
+
 export function classifyInbound(body: string): "opt_keyword" | "safety" | "normal" {
   // Trim, uppercase, drop trailing punctuation; the WHOLE message must match.
   const normalized = body
@@ -42,8 +112,11 @@ export function classifyInbound(body: string): "opt_keyword" | "safety" | "norma
     .replace(/[\s.,!?;:'"`)\]}*_~\-–—‘’“”…]+$/, "");
   if (OPT_KEYWORDS.has(normalized)) return "opt_keyword";
 
-  const lower = body.toLowerCase();
-  if (SAFETY_PHRASES.some((phrase) => lower.includes(phrase))) return "safety";
+  // Safety is judged clause by clause so "no smoke, but I smell gas" still
+  // alarms while "no gas smell, no smoke" does not. A message whose safety
+  // words are all denied is "normal": the model's own Safety rule covers it.
+  const lower = body.toLowerCase().replace(/[‘’]/g, "'");
+  if (lower.split(CLAUSE_BREAK).some(hasLiveSafetyPhrase)) return "safety";
 
   return "normal";
 }

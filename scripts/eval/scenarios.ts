@@ -27,6 +27,8 @@ export type TurnTrace = {
   // Simulated scenarios: what the simulated customer said next. "DONE" ends
   // the conversation and is never sent to the agent.
   customerNext: string | null;
+  // Extra questions the one-question guardrail cut from this turn's reply.
+  questionsTrimmed: number;
   logs: string[]; // console output the agent produced during this turn
 };
 
@@ -98,6 +100,24 @@ export function bookingTurn(t: Trace): number | null {
   );
   return i === -1 ? null : i + 1;
 }
+
+// The booking happened by customer turn `n`.
+const bookedByTurn = (n: number): Check => ({
+  description: `turns to booking <= ${n}`,
+  test: (t) => {
+    const turn = bookingTurn(t);
+    return turn !== null && turn <= n;
+  },
+});
+
+// The run that booked used at most `n` tool calls.
+const bookingRunToolCalls = (n: number, description: string): Check => ({
+  description,
+  test: (t) => {
+    const turn = bookingTurn(t);
+    return turn !== null && t.turns[turn - 1].toolCalls.length <= n;
+  },
+});
 
 // The simulated customer said DONE (so the conversation reached its goal or a
 // clean stop), after sending at most `n` texts to the agent.
@@ -220,7 +240,8 @@ const SCENARIO_LIST: Scenario[] = [
             (a) => a.work_order_id && t.tables.work_orders.some((w) => w.id === a.work_order_id),
           ),
       },
-      finishedWithin(6),
+      bookedByTurn(5),
+      bookingRunToolCalls(2, "the booking run made at most 2 tool calls"),
     ],
   },
   {
@@ -295,20 +316,8 @@ const SCENARIO_LIST: Scenario[] = [
         description: "a scheduled service_visit appointment exists",
         test: (t) => scheduled(t, "service_visit").length > 0,
       },
-      {
-        description: "turns to booking <= 3",
-        test: (t) => {
-          const n = bookingTurn(t);
-          return n !== null && n <= 3;
-        },
-      },
-      {
-        description: "the run that booked made at most 2 tool calls",
-        test: (t) => {
-          const n = bookingTurn(t);
-          return n !== null && t.turns[n - 1].toolCalls.length <= 2;
-        },
-      },
+      bookedByTurn(3),
+      bookingRunToolCalls(2, "the run that booked made at most 2 tool calls"),
       {
         description: "no successful save_customer_details call anywhere in the scenario",
         test: (t) => !allCalls(t).some((c) => c.name === "save_customer_details" && c.ok),
@@ -369,8 +378,16 @@ const SCENARIO_LIST: Scenario[] = [
   },
 ];
 
-// The one-question rule applies to every scenario.
+// The canned safety text is only right when the customer reports a real
+// hazard. Every scenario except the gas one must never see it.
+const NO_FALSE_SAFETY: Check = {
+  description: "no false safety alarm (no run has outcome safety)",
+  test: (t) => t.turns.every((turn) => turn.outcome !== "safety"),
+};
+
+// The one-question rule applies to every scenario; the false-alarm check to
+// every scenario except 5 (gas), which expects the safety outcome.
 export const SCENARIOS: Scenario[] = SCENARIO_LIST.map((s) => ({
   ...s,
-  checks: [...s.checks, ONE_QUESTION],
+  checks: s.id === "5" ? [...s.checks, ONE_QUESTION] : [...s.checks, ONE_QUESTION, NO_FALSE_SAFETY],
 }));

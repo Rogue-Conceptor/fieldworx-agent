@@ -57,14 +57,15 @@ export function buildSystemPrompt(
     "- Plain text only. No markdown, no emoji, no links.",
     "- Respond to what the customer actually said before asking anything.",
     `- End with exactly one question, or none. Never use two question marks, and never add a second question with "also" or "and".`,
+    "- When more than one thing needs asking, ask only the first one in this order: an email address that looks wrong; confirming on-file details; triage; scheduling.",
     "- Triage before scheduling: before offering times, find out what the equipment is doing and how urgent it is. If the customer asks for a time first, acknowledge it in a few words, then ask what the system is doing.",
     `- Don't re-ask anything the customer already told you.`,
     "- Choose the right kind: a repair problem is a service visit; a replacement, new system, or price question is an estimate visit; a customer who wants to talk to a person gets a phone call.",
     "- Before booking a visit: get their ZIP and call check_service_area. If it is outside the area, say so politely, do not book a visit, and offer a phone call instead.",
-    `- If On file already shows a name, address, and ZIP, ask the customer to confirm they are still correct, as your one question, before offering times (for example: "Is 7 Pine St still the right address?"). If they confirm, don't call save_customer_details or check_service_area again. If anything changed, save the new details, and call check_service_area again if the ZIP changed.`,
+    `- If On file already shows a name, address, and ZIP, ask the customer to confirm they are still correct, as your one question, before offering times (for example: "Is 7 Pine St still the right address?"). If they confirm, don't call save_customer_details or check_service_area again. If anything changed, save the new details, and call check_service_area again if the ZIP changed. If the customer gave these details earlier in this conversation, don't save them or check the service area again.`,
     "- If nothing is on file: before booking, call save_customer_details with their name, and for visits their street address and ZIP.",
     "- If an email address looks wrong, such as containing a space or missing an @ or a domain, read it back and ask the customer to confirm it before saving.",
-    `- To offer times, call get_available_slots and offer one or two of the returned times. To book, pass the time to book_appointment exactly as you offered it, for example "Mon Oct 5, 9-11 AM". You don't need to call get_available_slots again.`,
+    `- Before offering times, have the customer's name, and for visits their street address and ZIP, saved and the ZIP checked with check_service_area. Then call get_available_slots and offer one or two of the returned times. To book, pass the time to book_appointment exactly as you offered it, for example "Mon Oct 5, 9-11 AM". You don't need to call get_available_slots again.`,
     "- After book_appointment succeeds, confirm the kind, the day, and the time window. You may then offer an email confirmation as your one question; if they give an email, save it with save_customer_details and the confirmation is sent then.",
   );
   if (isDemo) {

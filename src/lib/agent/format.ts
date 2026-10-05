@@ -12,12 +12,75 @@ export function stripForHistory(body: string, prefix: string): string {
   return text.trim();
 }
 
-export function formatOutbound(text: string, prefix: string): string {
-  let out = text
+// A period after one of these does not end a sentence ("12 Elm St. Is that
+// right?" is one question, not a fragment and a question).
+const ABBREVIATIONS = new Set(["st", "ave", "rd", "dr", "ln", "blvd", "mr", "mrs", "ms", "a.m", "p.m"]);
+
+function endsWithAbbreviation(textBeforePeriod: string): boolean {
+  const word = /(?:^|\s)([A-Za-z.]+)$/.exec(textBeforePeriod);
+  return word !== null && ABBREVIATIONS.has(word[1].toLowerCase());
+}
+
+// Sentences end at ".", "?" or "!" (a run like "?!" counts once) that is
+// followed by whitespace or the end of the text. A period inside a number
+// ("98.6") or a time ("9-11 AM") never has whitespace after it, so it never
+// splits.
+function splitSentences(text: string): string[] {
+  const sentences: string[] = [];
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (!".?!".includes(text[i])) continue;
+    let end = i;
+    while (end + 1 < text.length && ".?!".includes(text[end + 1])) end++;
+    const next = text[end + 1];
+    const atBoundary = next === undefined || /\s/.test(next);
+    const abbreviation = text[end] === "." && endsWithAbbreviation(text.slice(start, end));
+    if (atBoundary && !abbreviation) {
+      sentences.push(text.slice(start, end + 1).trim());
+      start = end + 1;
+    }
+    i = end;
+  }
+  const rest = text.slice(start).trim();
+  if (rest) sentences.push(rest);
+  return sentences;
+}
+
+// At most one question per text: every sentence that does not end in "?" stays,
+// the first one that does stays, and later question sentences are dropped.
+// What is kept keeps its order and is rejoined with single spaces.
+export function limitQuestions(text: string): { text: string; dropped: number } {
+  let seenQuestion = false;
+  let dropped = 0;
+  const kept: string[] = [];
+  for (const sentence of splitSentences(text)) {
+    if (sentence.endsWith("?")) {
+      if (seenQuestion) {
+        dropped++;
+        continue;
+      }
+      seenQuestion = true;
+    }
+    kept.push(sentence);
+  }
+  return { text: kept.join(" "), dropped };
+}
+
+// The model's reply, ready to send: cleaned, trimmed to one question, capped in
+// length, then wrapped in the program prefix and the STOP line.
+// `questionsDropped` says how many extra questions the one-question rule cut.
+export function formatOutboundWithInfo(
+  text: string,
+  prefix: string,
+): { body: string; questionsDropped: number } {
+  const cleaned = text
     .replace(/[*`]/g, "")
     .replace(/\s*Reply\s+STOP\b[^.!?\n]*[.!?]?/gi, "")
     .replace(/\s+/g, " ")
     .trim();
+
+  const limited = limitQuestions(cleaned);
+  let out = limited.text;
 
   if (out.length > MAX_REPLY_CHARS) {
     // Last sentence end that fits; the space after it may sit at the limit.
@@ -29,5 +92,9 @@ export function formatOutbound(text: string, prefix: string): string {
     out = cut >= 0 ? out.slice(0, cut + 1) : out.slice(0, MAX_REPLY_CHARS).trimEnd();
   }
 
-  return `${prefix} ${out} ${STOP_SUFFIX}`;
+  return { body: `${prefix} ${out} ${STOP_SUFFIX}`, questionsDropped: limited.dropped };
+}
+
+export function formatOutbound(text: string, prefix: string): string {
+  return formatOutboundWithInfo(text, prefix).body;
 }
