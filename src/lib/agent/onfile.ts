@@ -5,7 +5,9 @@ import { slotLabel, type SlotKind } from "./clock";
 import { kindLabel } from "./emails";
 
 export type OnFile = {
-  customer: { id: string; name: string; email: string | null } | null;
+  // confirmed: the lead is linked to this customer. Unconfirmed: found only by
+  // the caller's phone number, so just the name is known (email stays null).
+  customer: { id: string; name: string; email: string | null; confirmed: boolean } | null;
   location: { id: string; address: string } | null;
   zip: string | null;
   appointments: {
@@ -19,12 +21,14 @@ export type OnFile = {
 
 // What the shop already knows about this lead: its customer, that customer's
 // most recent service location, and the lead's scheduled appointments. Always
-// scoped to the business. Throws on a database error.
+// scoped to the business. A lead with no customer yet falls back to the most
+// recently updated customer with the caller's phone number, returned
+// unconfirmed with nothing but its name. Throws on a database error.
 export async function loadOnFile(
   supabase: SupabaseClient,
-  args: { businessId: string; leadId: string },
+  args: { businessId: string; leadId: string; customerNumber: string },
 ): Promise<OnFile> {
-  const { businessId, leadId } = args;
+  const { businessId, leadId, customerNumber } = args;
 
   const { data: lead, error: leadError } = await supabase
     .from("leads")
@@ -49,6 +53,7 @@ export async function loadOnFile(
         id: customerRow.id,
         name: customerRow.name,
         email: customerRow.email ?? null,
+        confirmed: true,
       };
 
       const { data: locationRow, error: locationError } = await supabase
@@ -62,6 +67,29 @@ export async function loadOnFile(
       if (locationError) throw locationError;
       if (locationRow) location = { id: locationRow.id, address: locationRow.address };
     }
+  }
+
+  // Not linked yet: someone with this phone number may have been here before.
+  // Only the name is read, so nothing else about them can reach the prompt.
+  if (!customer && customerNumber) {
+    const { data: byPhone, error: byPhoneError } = await supabase
+      .from("customers")
+      .select("id, name")
+      .eq("business_id", businessId)
+      .eq("phone", customerNumber)
+      .order("updated_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (byPhoneError) throw byPhoneError;
+    if (byPhone) {
+      customer = { id: byPhone.id, name: byPhone.name, email: null, confirmed: false };
+    }
+  }
+
+  // An unconfirmed customer has no appointments to show: booking needs a
+  // linked customer, so the lead cannot hold any.
+  if (customer && !customer.confirmed) {
+    return { customer, location: null, zip: null, appointments: [] };
   }
 
   const { data: appointmentRows, error: appointmentError } = await supabase
@@ -94,7 +122,12 @@ function oneLine(value: string): string {
 }
 
 // Bullet lines for the system prompt's "On file for this customer" section.
+// An unconfirmed customer shows only a name, never an address, email or
+// appointment.
 export function formatOnFile(onFile: OnFile): string {
+  if (onFile.customer && !onFile.customer.confirmed) {
+    return `- Name (from an earlier conversation, not yet confirmed): ${oneLine(onFile.customer.name)}`;
+  }
   if (!onFile.customer && !onFile.location && onFile.appointments.length === 0) {
     return "- Nothing on file yet.";
   }

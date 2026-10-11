@@ -261,6 +261,7 @@ export async function processInbound(
         const onFile = await loadOnFile(supabase, {
           businessId: a.businessId,
           leadId: a.leadId,
+          customerNumber: a.customerNumber,
         });
         const system = buildSystemPrompt(profile, formatOnFile(onFile));
         const anthropic =

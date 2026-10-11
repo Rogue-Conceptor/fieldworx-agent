@@ -126,7 +126,7 @@ async function main() {
           address: location,
         });
       }
-      lead.customer_id = customer.id;
+      if (scenario.seed.linked !== false) lead.customer_id = customer.id;
     }
     const conversation = seed(db, "conversations", {
       business_id: business.id,

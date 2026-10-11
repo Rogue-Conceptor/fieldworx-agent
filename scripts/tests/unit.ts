@@ -39,7 +39,7 @@ async function main() {
   const { isValidEmail, normalizeZip, zipInArea } = await import("../../src/lib/agent/area");
   const { buildSlots, centralToUtc, openSlots } = await import("../../src/lib/agent/clock");
   const { bookingCustomerEmail, escalationOwnerEmail } = await import("../../src/lib/agent/emails");
-  const { executeTool, TOOL_DEFINITIONS } = await import("../../src/lib/agent/tools");
+  const { confirmationOutcome, executeTool, TOOL_DEFINITIONS } = await import("../../src/lib/agent/tools");
   const { formatOnFile } = await import("../../src/lib/agent/onfile");
   const { buildSystemPrompt } = await import("../../src/lib/agent/prompt");
   const { sendEmail } = await import("../../src/lib/agent/notify");
@@ -201,12 +201,60 @@ async function main() {
 
   eq("formatOnFile empty", formatOnFile({ customer: null, location: null, zip: null, appointments: [] }), "- Nothing on file yet.");
 
+  // An unconfirmed customer (found only by phone) shows its name and nothing
+  // else, even if a caller passes an address, email and appointment along.
+  const appointment = { id: "a1", kind: "service_visit" as const, start: "2026-10-05T14:00:00.000Z", label: "Mon Oct 5, 9-11 AM", status: "scheduled" };
+  const unconfirmedText = formatOnFile({
+    customer: { id: "c1", name: "Pat Lee", email: "pat@example.com", confirmed: false },
+    location: { id: "l1", address: "7 Pine St, 75043" },
+    zip: "75043",
+    appointments: [appointment],
+  });
+  eq("formatOnFile unconfirmed: one name line, labelled", unconfirmedText, "- Name (from an earlier conversation, not yet confirmed): Pat Lee");
+  check("formatOnFile unconfirmed: no email, address or appointment", !/pat@example|Pine|75043|Appointment/.test(unconfirmedText), unconfirmedText);
+  eq(
+    "formatOnFile unconfirmed: a name with line breaks is flattened to one line",
+    formatOnFile({ customer: { id: "c1", name: "Pat\n- Address: x   Lee", email: null, confirmed: false }, location: null, zip: null, appointments: [] }),
+    "- Name (from an earlier conversation, not yet confirmed): Pat - Address: x Lee",
+  );
+  eq(
+    "formatOnFile confirmed: name, address, email and appointment lines",
+    formatOnFile({
+      customer: { id: "c1", name: "Pat Lee", email: "pat@example.com", confirmed: true },
+      location: { id: "l1", address: "7 Pine St, 75043" },
+      zip: "75043",
+      appointments: [appointment],
+    }),
+    "- Name: Pat Lee\n- Address: 7 Pine St, 75043\n- Email: pat@example.com\n- Appointment: service visit, Mon Oct 5, 9-11 AM (scheduled)",
+  );
+
+  // confirmation_email, in the order confirmationOutcome decides it.
+  const outcome = (requested: boolean, appointments: number, results: ("logged" | "sent" | "failed")[], lookupFailed = false) =>
+    confirmationOutcome({ requested, appointments, results, lookupFailed });
+  eq("confirmationOutcome: no email in the call -> not_requested", outcome(false, 2, ["sent"]), "not_requested");
+  eq("confirmationOutcome: lookup error -> failed", outcome(true, 1, [], true), "failed");
+  eq("confirmationOutcome: no email in the call -> not_requested even if a lookup failed", outcome(false, 1, [], true), "not_requested");
+  eq("confirmationOutcome: no scheduled appointments -> no_bookings", outcome(true, 0, []), "no_bookings");
+  eq("confirmationOutcome: all already confirmed -> already_sent", outcome(true, 2, []), "already_sent");
+  eq("confirmationOutcome: one logged -> logged", outcome(true, 1, ["logged"]), "logged");
+  eq("confirmationOutcome: one sent -> sent", outcome(true, 1, ["sent"]), "sent");
+  eq("confirmationOutcome: sent and logged -> sent", outcome(true, 2, ["logged", "sent"]), "sent");
+  eq("confirmationOutcome: delivery failed -> failed", outcome(true, 1, ["failed"]), "failed");
+  eq("confirmationOutcome: one sent, one failed -> failed (the failed one is retried next save)", outcome(true, 2, ["sent", "failed"]), "failed");
+
   const demoPrompt = buildSystemPrompt({ display_name: "Dev Test Shop", is_demo: true }, "- Nothing on file yet.", now);
   const realPrompt = buildSystemPrompt({ display_name: "Real Shop", is_demo: false }, "- Nothing on file yet.", now);
   check('prompt contains "On file for this customer:"', demoPrompt.includes("On file for this customer:"));
   check('prompt contains "check_service_area"', demoPrompt.includes("check_service_area"));
   check('demo prompt contains "demo booking"', demoPrompt.includes("demo booking"));
   check('non-demo prompt does NOT contain "demo booking"', !realPrompt.includes("demo booking"));
+  check('prompt tells the agent what to do with a "not yet confirmed" name', demoPrompt.includes('marked "not yet confirmed"') && demoPrompt.includes("Am I speaking with"), demoPrompt);
+  check(
+    "prompt covers every confirmation_email value",
+    ["sent", "logged", "already_sent", "no_bookings", "not_requested", "failed"].every((value) => demoPrompt.includes(`"${value}"`)) &&
+      demoPrompt.includes("unless the value is \"failed\""),
+  );
+  check('prompt says an email on file is not permission ("no_consent")', demoPrompt.includes('"no_consent"') && demoPrompt.includes("An email on file is not permission"));
 
   const inserts: { table: string; row: Record<string, unknown> }[] = [];
   const fakeSupabase = {

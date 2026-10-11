@@ -73,7 +73,7 @@ export const TOOL_DEFINITIONS: Anthropic.Tool[] = [
   {
     name: "save_customer_details",
     description:
-      "Save what the customer has told you: their name, and for visits their street address and ZIP, and an email only if they chose to give one. Safe to call again to add details. Saving an email after a booking also sends the confirmation for that booking.",
+      "Save what the customer has told you: their name, and for visits their street address and ZIP, and an email only if they gave one or agreed to the one on file. Pass the name exactly as On file shows it unless the customer corrects it. Safe to call again to add details. Saving an email records their permission to email booking confirmations to that address and sends any not yet sent; the result's confirmation_email says what happened.",
     input_schema: {
       type: "object",
       properties: {
@@ -205,16 +205,46 @@ function findSlot(open: Slot[], requested: string): Slot | undefined {
   return open.find((s) => normalizeLabel(s.label) === wanted);
 }
 
+export type ConfirmationEmail =
+  | "sent"
+  | "logged"
+  | "already_sent"
+  | "no_bookings"
+  | "failed"
+  | "not_requested";
+
+type ConfirmationRun = {
+  appointments: number; // scheduled appointments on this lead
+  results: EmailStatus[]; // one per confirmation this call attempted
+  lookupFailed: boolean;
+};
+
+// What the model is told about the confirmation email after a save. A lookup
+// error counts as "failed": the confirmation could not be sent.
+export function confirmationOutcome(args: {
+  requested: boolean;
+  appointments: number;
+  results: EmailStatus[];
+  lookupFailed: boolean;
+}): ConfirmationEmail {
+  if (!args.requested) return "not_requested";
+  if (args.lookupFailed) return "failed";
+  if (args.appointments === 0) return "no_bookings";
+  if (args.results.length === 0) return "already_sent";
+  if (args.results.includes("failed")) return "failed";
+  return args.results.includes("sent") ? "sent" : "logged";
+}
+
 // An email that arrives after the booking still gets its confirmation: every
-// scheduled appointment on this lead that has no customer notification yet is
-// confirmed to the new address. Returns how many went out (logged counts, a
-// failed send does not). Lookup errors mean none are sent; they never fail the
-// save.
+// scheduled appointment on this lead that has no sent or logged customer
+// notification to this same address is confirmed to it. A failed earlier send,
+// or one to a different address, does not count, so it is tried again. Lookup
+// errors mean none are sent; they never fail the save.
 async function sendMissingConfirmations(
   ctx: ToolContext,
   customerName: string,
   to: string,
-): Promise<number> {
+): Promise<ConfirmationRun> {
   const { supabase, businessId, profile } = ctx;
   const { data: appointments, error: appointmentError } = await supabase
     .from("appointments")
@@ -223,27 +253,36 @@ async function sendMissingConfirmations(
     .eq("business_id", businessId)
     .eq("status", "scheduled")
     .order("starts_at", { ascending: true });
-  if (appointmentError || !appointments || appointments.length === 0) {
-    if (appointmentError) console.error("[tools] confirmation lookup failed");
-    return 0;
+  if (appointmentError || !appointments) {
+    console.error("[tools] confirmation lookup failed");
+    return { appointments: 0, results: [], lookupFailed: true };
+  }
+  if (appointments.length === 0) {
+    return { appointments: 0, results: [], lookupFailed: false };
   }
 
   const { data: existing, error: notificationError } = await supabase
     .from("notifications")
-    .select("appointment_id")
+    .select("appointment_id, recipient")
     .eq("business_id", businessId)
     .eq("audience", "customer")
+    .in("status", ["sent", "logged"])
     .in(
       "appointment_id",
       appointments.map((a) => a.id as string),
     );
   if (notificationError) {
     console.error("[tools] confirmation lookup failed");
-    return 0;
+    return { appointments: appointments.length, results: [], lookupFailed: true };
   }
-  const confirmed = new Set((existing ?? []).map((n) => n.appointment_id as string));
+  const wanted = to.toLowerCase();
+  const confirmed = new Set(
+    (existing ?? [])
+      .filter((n) => String(n.recipient ?? "").toLowerCase() === wanted)
+      .map((n) => n.appointment_id as string),
+  );
 
-  let sent = 0;
+  const results: EmailStatus[] = [];
   for (const appointment of appointments) {
     if (confirmed.has(appointment.id as string)) continue;
     const kind = appointment.kind as SlotKind;
@@ -264,9 +303,9 @@ async function sendMissingConfirmations(
       template: "booking_customer",
       ...mail,
     });
-    if (result.status !== "failed") sent++;
+    results.push(result.status);
   }
-  return sent;
+  return { appointments: appointments.length, results, lookupFailed: false };
 }
 
 async function getAvailableSlots(
@@ -315,29 +354,38 @@ async function saveCustomerDetails(
   const { supabase, businessId } = ctx;
   let wrote = false;
 
-  // The customer is whoever owns this phone number at this business.
-  const { data: existing, error: findError } = await supabase
+  // One customer per person: among this business's customers with this phone
+  // number, the one with the same name (ignoring case and spacing). That row is
+  // never renamed, and an email is never copied in from another row. The name
+  // is compared in code, not with ilike, so % and _ in a name stay literal.
+  const { data: sameNumber, error: findError } = await supabase
     .from("customers")
-    .select("id, email")
+    .select("id, name, email")
     .eq("business_id", businessId)
     .eq("phone", ctx.customerNumber)
-    .order("created_at", { ascending: true })
-    .limit(1)
-    .maybeSingle();
+    .order("updated_at", { ascending: false });
   if (findError) return fail(SAVE_FAILED);
+  const wantedName = name.toLowerCase();
+  const existing = (sameNumber ?? []).find(
+    (row) => textOf(row.name).toLowerCase() === wantedName,
+  );
 
   let customerId: string;
-  const previousEmail: string | null = existing?.email ?? null;
-  let email: string | null = previousEmail;
+  let customerName = name;
+  let email: string | null;
   if (existing) {
-    const { error } = await supabase
-      .from("customers")
-      .update(emailText ? { name, email: emailText } : { name })
-      .eq("id", existing.id)
-      .eq("business_id", businessId);
-    if (error) return fail(SAVE_FAILED);
+    email = (existing.email as string | null) ?? null;
+    if (emailText && emailText !== email) {
+      const { error } = await supabase
+        .from("customers")
+        .update({ email: emailText })
+        .eq("id", existing.id)
+        .eq("business_id", businessId);
+      if (error) return fail(SAVE_FAILED);
+      email = emailText;
+    }
     customerId = existing.id;
-    if (emailText) email = emailText;
+    customerName = existing.name as string;
   } else {
     const { data: created, error } = await supabase
       .from("customers")
@@ -396,19 +444,56 @@ async function saveCustomerDetails(
     .eq("business_id", businessId);
   if (leadError) return fail(SAVE_FAILED, wrote);
 
-  // A newly saved (or changed) email also confirms bookings made earlier.
-  const emailChanged =
-    emailText !== "" && emailText.toLowerCase() !== (previousEmail ?? "").toLowerCase();
-  const confirmationsSent = emailChanged
-    ? await sendMissingConfirmations(ctx, name, emailText)
-    : 0;
+  // An email given in this conversation is the customer's permission to email
+  // confirmations to that address. Both consent columns are written together
+  // (the table's pair rule) and only when the address is new for this
+  // conversation, so the original timestamp survives a repeated save.
+  if (emailText) {
+    const { data: conversation, error: conversationError } = await supabase
+      .from("conversations")
+      .select("email_consent_address")
+      .eq("id", ctx.conversationId)
+      .eq("business_id", businessId)
+      .maybeSingle();
+    if (conversationError || !conversation) {
+      console.error("[tools] consent lookup failed");
+      return fail(SAVE_FAILED, wrote);
+    }
+    const recorded = (conversation.email_consent_address as string | null) ?? null;
+    if (recorded === null || recorded.toLowerCase() !== emailText.toLowerCase()) {
+      const { data: updated, error: consentError } = await supabase
+        .from("conversations")
+        .update({
+          email_consent_address: emailText,
+          email_consent_at: new Date().toISOString(),
+        })
+        .eq("id", ctx.conversationId)
+        .eq("business_id", businessId)
+        .select("id");
+      // An update that matches no row is not an error, so count the rows.
+      if (consentError || !updated || updated.length === 0) {
+        console.error("[tools] consent record failed");
+        return fail(SAVE_FAILED, wrote);
+      }
+    }
+  }
+
+  // Every save that carries an email sends whatever confirmations are still
+  // missing for that address; with nothing missing it sends nothing.
+  const confirmation: ConfirmationRun = emailText
+    ? await sendMissingConfirmations(ctx, customerName, emailText)
+    : { appointments: 0, results: [], lookupFailed: false };
 
   return done(
     {
       saved: true,
       has_address: hasAddress,
       has_email: Boolean(email),
-      confirmations_sent: confirmationsSent,
+      confirmation_email: confirmationOutcome({
+        requested: emailText !== "",
+        ...confirmation,
+      }),
+      confirmations_sent: confirmation.results.filter((status) => status !== "failed").length,
     },
     true,
   );
@@ -437,9 +522,17 @@ async function bookAppointment(
   if (!slot) return fail(SLOT_UNAVAILABLE);
 
   // b-d. what must be on file before this lead can hold this appointment
-  const onFile = await loadOnFile(supabase, { businessId, leadId: ctx.leadId });
+  const onFile = await loadOnFile(supabase, {
+    businessId,
+    leadId: ctx.leadId,
+    customerNumber: ctx.customerNumber,
+  });
   const customer = onFile.customer;
-  if (!customer || !customer.name) return fail("Save the customer's name first.");
+  // An unconfirmed customer (found only by phone) is not this lead's customer
+  // until save_customer_details links it.
+  if (!customer || !customer.confirmed || !customer.name) {
+    return fail("Save the customer's name first.");
+  }
 
   const isVisit = kind !== "phone_call";
   const location = onFile.location;
@@ -554,8 +647,20 @@ async function bookAppointment(
       })()
     : Promise.resolve("no_owner_email");
 
-  const customerTo = customer.email;
-  const customerSend: Promise<EmailStatus | "no_email"> = customerTo
+  // The customer is emailed only at the address they agreed to in this
+  // conversation. An email on their record is not permission. A lookup error
+  // counts as no permission, and never fails the booking.
+  const { data: consentRow, error: consentError } = await supabase
+    .from("conversations")
+    .select("email_consent_address")
+    .eq("id", ctx.conversationId)
+    .eq("business_id", businessId)
+    .maybeSingle();
+  if (consentError) console.error("[tools] consent lookup failed");
+  const customerTo: string | null = consentError
+    ? null
+    : ((consentRow?.email_consent_address as string | null | undefined) ?? null);
+  const customerSend: Promise<EmailStatus | "no_consent"> = customerTo
     ? (() => {
         const mail = bookingCustomerEmail({
           kindLabel: label,
@@ -572,7 +677,7 @@ async function bookAppointment(
           ...mail,
         }).then((r) => r.status);
       })()
-    : Promise.resolve("no_email");
+    : Promise.resolve("no_consent");
 
   const [owner, customerStatus] = await Promise.all([ownerSend, customerSend]);
   return done(

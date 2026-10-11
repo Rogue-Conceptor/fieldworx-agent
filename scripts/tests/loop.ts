@@ -164,6 +164,17 @@ function world(options: { profile?: Record<string, unknown>; newerInbound?: bool
   };
   seed(db, "businesses", { id: BIZ, agent_profile: profile });
   seed(db, "leads", { id: LEAD, business_id: BIZ, customer_id: null, work_order_id: null, urgency: null });
+  seed(db, "conversations", {
+    id: CONV,
+    business_id: BIZ,
+    lead_id: LEAD,
+    channel: "sms",
+    customer_number: PHONE,
+    business_number: BUSINESS_NUMBER,
+    status: "active",
+    email_consent_address: null,
+    email_consent_at: null,
+  });
   seed(db, "messages", {
     id: INBOUND,
     business_id: BIZ,
@@ -208,6 +219,29 @@ const book =
     input: { kind: "service_visit", slot: slotStart ?? firstOfferedSlot(snap).start, issue_summary: "AC not cooling" },
   });
 const resultOf = (agentRun: Row, index: number) => JSON.parse(agentRun.tool_calls[index].result);
+
+// A customer already on record for PHONE, as an earlier conversation left it.
+// `linked` ties it to this test's lead, as save_customer_details would have.
+function seedCustomer(
+  db: FakeSupabase,
+  options: { name: string; email: string | null; address?: string; linked?: boolean },
+): Row {
+  const customer = seed(db, "customers", {
+    business_id: BIZ,
+    name: options.name,
+    phone: PHONE,
+    email: options.email,
+    source: "agent_inbound",
+  });
+  if (options.address) {
+    seed(db, "service_locations", { business_id: BIZ, customer_id: customer.id, address: options.address });
+  }
+  if (options.linked) db.tables.leads.find((l) => l.id === LEAD)!.customer_id = customer.id;
+  return customer;
+}
+const customerMail = (db: FakeSupabase) => db.tables.notifications.filter((n) => n.audience === "customer");
+const consentWrites = (db: FakeSupabase) =>
+  db.log.filter((l) => l.table === "conversations" && l.op === "update" && "email_consent_address" in (l.payload ?? {}));
 
 // ---------------------------------------------------------------------- main
 
@@ -301,6 +335,9 @@ async function main() {
     same("2 notifications", t.notifications.length, 2);
     fact("owner notification: logged, booking_owner, owner@example.com, linked to the appointment", t.notifications[0]?.audience === "owner" && t.notifications[0].status === "logged" && t.notifications[0].template === "booking_owner" && t.notifications[0].recipient === "owner@example.com" && t.notifications[0].appointment_id === appointment?.id, t.notifications[0]);
     fact("customer notification: logged, booking_customer, pat@example.com", t.notifications[1]?.audience === "customer" && t.notifications[1].status === "logged" && t.notifications[1].template === "booking_customer" && t.notifications[1].recipient === "pat@example.com", t.notifications[1]);
+    fact("consent recorded on the conversation: the address, with a timestamp", t.conversations[0].email_consent_address === "pat@example.com" && !Number.isNaN(Date.parse(t.conversations[0].email_consent_at)), t.conversations[0]);
+    same("save result before any booking: confirmation_email no_bookings, none sent", [resultOf(agentRun, 0).confirmation_email, resultOf(agentRun, 0).confirmations_sent], ["no_bookings", 0]);
+    same("book result: customer email is logged", resultOf(agentRun, 3).emails, { owner: "logged", customer: "logged" });
     same("1 agent_runs row", t.agent_runs.length, 1);
     same("agent_runs outcome replied", agentRun?.outcome, "replied");
     same("agent_runs tool_calls: 4, in order, all ok", agentRun?.tool_calls.map((c: any) => `${c.name}:${c.ok}`), ["save_customer_details:true", "check_service_area:true", "get_available_slots:true", "book_appointment:true"]);
@@ -323,7 +360,7 @@ async function main() {
     const t = db.tables;
     same("1 appointment, 1 work order", [t.appointments.length, t.work_orders.length], [1, 1]);
     same("exactly 1 notification (owner, logged)", t.notifications.map((n) => `${n.audience}:${n.status}`), ["owner:logged"]);
-    same("book result: customer email is no_email", resultOf(t.agent_runs[0], 3).emails, { owner: "logged", customer: "no_email" });
+    same("book result: customer email is no_consent", resultOf(t.agent_runs[0], 3).emails, { owner: "logged", customer: "no_consent" });
   });
 
   await testCase("2   work order insert fails (compensating delete)", async () => {
@@ -491,6 +528,178 @@ async function main() {
     same("agent_runs outcome replied", t.agent_runs[0].outcome, "replied");
     fact('log line "[agent] trimmed 1 extra question(s)" written', lines.includes("[agent] trimmed 1 extra question(s)"), lines);
     same("no log line carries any message text", lines.filter((l) => l.includes("Is it running") || l.includes("anyone home")), []);
+  });
+
+  // ---- returning customers and email consent ----
+
+  // What the prompt shows under "On file for this customer:".
+  const onFileBlock = (system: string) =>
+    system.split("On file for this customer:\n")[1]?.split("\n\nHow to reply:")[0] ?? "";
+  const leakedFrom = (lines: string[], values: string[]) =>
+    values.filter((value) => lines.some((l) => l.includes(value)));
+  const SAVE_FAILED_TEXT = "Couldn't save the details right now. Please try again.";
+
+  await testCase("14  returning phone, unlinked lead, same name (linked, no duplicate, no email without consent)", async () => {
+    const { db, args } = world();
+    const old = seedCustomer(db, { name: "Pat Lee", email: "pat@old.example", address: "9 Oak St, 75043" });
+    const { model, lines } = await run(db, args, [
+      toolStep(save({ name: " pat  LEE ", street_address: "9 Oak St", zip: "75043" })),
+      toolStep(checkArea()),
+      toolStep(getSlots()),
+      toolStep(book()),
+      textStep("You're booked."),
+    ]);
+    const t = db.tables;
+    same("first prompt: only the name, marked not yet confirmed", onFileBlock(model.calls[0].system), "- Name (from an earlier conversation, not yet confirmed): Pat Lee");
+    same("still one customer, name and email untouched", t.customers.map((c) => [c.name, c.email]), [["Pat Lee", "pat@old.example"]]);
+    same("the address already on record is not added twice", t.service_locations.length, 1);
+    same("lead linked to the existing customer", t.leads[0].customer_id, old.id);
+    same("appointment is for the existing customer", t.appointments[0]?.customer_id, old.id);
+    same("book result: customer email is no_consent", resultOf(t.agent_runs[0], 3).emails, { owner: "logged", customer: "no_consent" });
+    same("only the owner was emailed", t.notifications.map((n) => `${n.audience}:${n.status}`), ["owner:logged"]);
+    same("consent never recorded", [t.conversations[0].email_consent_address, t.conversations[0].email_consent_at], [null, null]);
+    same("no log line contains the name, address, email or phone number", leakedFrom(lines, ["Pat Lee", "Oak St", "pat@old.example", PHONE]), []);
+  });
+
+  await testCase("15  returning phone, different name (new customer; the old row is untouched)", async () => {
+    const { db, args } = world();
+    const old = seedCustomer(db, { name: "Pat Lee", email: "pat@old.example", address: "9 Oak St, 75043" });
+    await run(db, args, [
+      toolStep(save({ name: "Dana Ruiz", street_address: "40 Maple Dr", zip: "75044" })),
+      textStep("Thanks Dana."),
+    ]);
+    const t = db.tables;
+    const created = t.customers.find((c) => c.id !== old.id);
+    same("two customers", t.customers.length, 2);
+    same("old row: name and email untouched", t.customers.filter((c) => c.id === old.id).map((c) => [c.name, c.email]), [["Pat Lee", "pat@old.example"]]);
+    fact("new row: name, this phone, email null, agent_inbound", created?.name === "Dana Ruiz" && created.phone === PHONE && created.email === null && created.source === "agent_inbound", created);
+    same("lead linked to the new customer", t.leads[0].customer_id, created?.id);
+    same("each customer has its own address", t.service_locations.map((l) => [l.customer_id === old.id ? "old" : "new", l.address]), [["old", "9 Oak St, 75043"], ["new", "40 Maple Dr, 75044"]]);
+    same("save result: no email asked for", [resultOf(t.agent_runs[0], 0).has_email, resultOf(t.agent_runs[0], 0).confirmation_email, resultOf(t.agent_runs[0], 0).confirmations_sent], [false, "not_requested", 0]);
+  });
+
+  await testCase("16  email on the customer record but no consent -> no_consent, no customer notification", async () => {
+    const { db, args } = world();
+    seedCustomer(db, { name: "Pat Lee", email: "pat@old.example", address: "9 Oak St, 75043", linked: true });
+    const { model } = await run(db, args, [toolStep(getSlots()), toolStep(book()), textStep("You're booked.")]);
+    const t = db.tables;
+    same("prompt shows the confirmed customer's email", onFileBlock(model.calls[0].system).includes("- Email: pat@old.example"), true);
+    same("book result: customer email is no_consent", resultOf(t.agent_runs[0], 1).emails, { owner: "logged", customer: "no_consent" });
+    same("no customer notification row", customerMail(db).length, 0);
+    same("the owner was still emailed", t.notifications.map((n) => `${n.audience}:${n.status}`), ["owner:logged"]);
+  });
+
+  await testCase("17  email given after booking -> consent set, one confirmation (logged)", async () => {
+    const { db, args } = world();
+    const { lines } = await run(db, args, [
+      toolStep(save()),
+      toolStep(checkArea()),
+      toolStep(getSlots()),
+      toolStep(book()),
+      toolStep(save({ email: "pat@example.com" })),
+      textStep("Done."),
+    ]);
+    const t = db.tables;
+    const run0 = t.agent_runs[0];
+    same("book result before the email: customer is no_consent", resultOf(run0, 3).emails, { owner: "logged", customer: "no_consent" });
+    same("save result: confirmation_email logged, 1 sent, email on file", [resultOf(run0, 4).confirmation_email, resultOf(run0, 4).confirmations_sent, resultOf(run0, 4).has_email], ["logged", 1, true]);
+    fact("consent recorded: the address, with a timestamp", t.conversations[0].email_consent_address === "pat@example.com" && !Number.isNaN(Date.parse(t.conversations[0].email_consent_at)), t.conversations[0]);
+    same("one customer notification: booking_customer, logged, to that address, for the appointment", customerMail(db).map((n) => [n.template, n.status, n.recipient, n.appointment_id]), [["booking_customer", "logged", "pat@example.com", t.appointments[0].id]]);
+    same("customer row has the email", t.customers[0].email, "pat@example.com");
+    same("no log line contains the name, address, email or phone number", leakedFrom(lines, ["Pat Lee", "Main St", "pat@example.com", PHONE]), []);
+  });
+
+  await testCase("18  same email again -> already_sent, nothing new", async () => {
+    const { db, args } = world();
+    await run(db, args, [
+      toolStep(save()),
+      toolStep(checkArea()),
+      toolStep(getSlots()),
+      toolStep(book()),
+      // one round (the loop allows five), run in order
+      toolStep(save({ email: "pat@example.com" }), save({ email: "pat@example.com" })),
+      textStep("Done."),
+    ]);
+    const t = db.tables;
+    const results = [4, 5].map((i) => resultOf(t.agent_runs[0], i));
+    same("first email save: logged, 1 sent", [results[0].confirmation_email, results[0].confirmations_sent], ["logged", 1]);
+    same("same email again: already_sent, 0 sent", [results[1].confirmation_email, results[1].confirmations_sent], ["already_sent", 0]);
+    same("still one customer notification", customerMail(db).length, 1);
+    same("consent written once (the timestamp is not renewed)", consentWrites(db).length, 1);
+  });
+
+  await testCase("19  email before any booking -> no_bookings; the booking is then emailed at the consent address", async () => {
+    const { db, args } = world();
+    await run(db, args, [
+      toolStep(save({ email: "pat@example.com" })),
+      toolStep(checkArea()),
+      toolStep(getSlots()),
+      toolStep(book()),
+      textStep("You're booked."),
+    ]);
+    const t = db.tables;
+    same("save result: no_bookings, 0 sent", [resultOf(t.agent_runs[0], 0).confirmation_email, resultOf(t.agent_runs[0], 0).confirmations_sent], ["no_bookings", 0]);
+    same("consent recorded", t.conversations[0].email_consent_address, "pat@example.com");
+    same("book result: customer email is logged", resultOf(t.agent_runs[0], 3).emails, { owner: "logged", customer: "logged" });
+    same("customer notification goes to the consent address", customerMail(db).map((n) => n.recipient), ["pat@example.com"]);
+  });
+
+  await testCase("20  save without an email -> not_requested; the record's email and consent untouched", async () => {
+    const { db, args } = world();
+    seedCustomer(db, { name: "Pat Lee", email: "pat@old.example", address: "1 Main St, 75043", linked: true });
+    await run(db, args, [toolStep(save()), textStep("Thanks.")]);
+    const t = db.tables;
+    same("save result: not_requested, 0 sent", [resultOf(t.agent_runs[0], 0).confirmation_email, resultOf(t.agent_runs[0], 0).confirmations_sent], ["not_requested", 0]);
+    same("customer email unchanged", t.customers.map((c) => c.email), ["pat@old.example"]);
+    same("consent not recorded, no notifications", [t.conversations[0].email_consent_address, t.notifications.length], [null, 0]);
+  });
+
+  await testCase("21  consent cannot be recorded (update fails, or the conversation row is missing)", async () => {
+    for (const how of ["the update fails", "the conversation row is missing"]) {
+      const { db, args } = world();
+      if (how === "the update fails") db.failNext("conversations", "update", { message: "boom", code: "XX000" });
+      else db.tables.conversations.length = 0;
+      const { lines } = await run(db, args, [toolStep(save({ email: "pat@example.com" })), textStep("Sorry, try again.")]);
+      const call = db.tables.agent_runs[0].tool_calls[0];
+      same(`${how}: the save fails, and reports that it wrote`, [call.ok, call.wrote, resultOf(db.tables.agent_runs[0], 0).error], [false, true, SAVE_FAILED_TEXT]);
+      same(`${how}: no consent, no email sent`, [db.tables.conversations[0]?.email_consent_address ?? null, db.tables.notifications.length], [null, 0]);
+      same(`${how}: no log line contains the name, email or phone number`, leakedFrom(lines, ["Pat Lee", "pat@example.com", PHONE]), []);
+    }
+  });
+
+  await testCase("22  an unconfirmed customer (found by phone only) cannot be booked", async () => {
+    const { db, args } = world();
+    seedCustomer(db, { name: "Pat Lee", email: null, address: "9 Oak St, 75043" });
+    await run(db, args, [toolStep(getSlots()), toolStep(book()), textStep("Let me get your name first.")]);
+    const t = db.tables;
+    const call = t.agent_runs[0].tool_calls[1];
+    same("book_appointment refuses", [call.ok, resultOf(t.agent_runs[0], 1).error], [false, "Save the customer's name first."]);
+    same("no appointment, no work order, no notification", [t.appointments.length, t.work_orders.length, t.notifications.length], [0, 0, 0]);
+    same("lead still unlinked", t.leads[0].customer_id, null);
+  });
+
+  await testCase("23  corrected email after booking -> confirmed again at the new address", async () => {
+    const { db, args } = world();
+    await run(db, args, [
+      toolStep(save()),
+      toolStep(checkArea()),
+      toolStep(getSlots()),
+      toolStep(book()),
+      // one round (the loop allows five), run in order
+      toolStep(
+        save({ email: "pat@typo.example" }),
+        save({ email: "pat@example.com" }),
+        save({ email: "PAT@Example.com" }),
+      ),
+      textStep("Done."),
+    ]);
+    const t = db.tables;
+    const results = [4, 5, 6].map((i) => resultOf(t.agent_runs[0], i));
+    same("first address: logged, 1 sent", [results[0].confirmation_email, results[0].confirmations_sent], ["logged", 1]);
+    same("corrected address: logged, 1 sent again", [results[1].confirmation_email, results[1].confirmations_sent], ["logged", 1]);
+    same("same corrected address in other letter case: already_sent", [results[2].confirmation_email, results[2].confirmations_sent], ["already_sent", 0]);
+    same("customer notifications went to each address once", customerMail(db).map((n) => n.recipient), ["pat@typo.example", "pat@example.com"]);
+    same("consent follows the corrected address; the case-only change writes nothing", [t.conversations[0].email_consent_address, consentWrites(db).length], ["pat@example.com", 2]);
   });
 
   // ---------------------------------------------------------------------------

@@ -9,7 +9,8 @@
     "lint": "next lint",
     "eval": "tsx --env-file=.env.local --conditions=react-server scripts/eval/run.ts",
     "test:unit": "tsx --conditions=react-server scripts/tests/unit.ts",
-    "test:loop": "tsx --conditions=react-server scripts/tests/loop.ts"
+    "test:loop": "tsx --conditions=react-server scripts/tests/loop.ts",
+    "test:email-fail": "tsx --conditions=react-server scripts/tests/email-fail.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0",

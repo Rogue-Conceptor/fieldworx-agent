@@ -43,8 +43,10 @@ export type Check = { description: string; test: (t: Trace) => boolean };
 type ScenarioBase = {
   id: string;
   title: string;
-  // An already-known customer, linked to the lead before the first text.
-  seed?: { customer: { name: string; email: string | null; location?: string } };
+  // An already-known customer with this phone number. Linked to the lead
+  // before the first text unless `linked` is false: that is a returning caller
+  // whose new conversation starts with no customer on its lead.
+  seed?: { customer: { name: string; email: string | null; location?: string }; linked?: boolean };
   checks: Check[];
 };
 
@@ -91,6 +93,14 @@ const scheduled = (t: Trace, kind: string): Row[] =>
   t.tables.appointments.filter((a) => a.kind === kind && a.status === "scheduled");
 const noVisitAppointment = (t: Trace): boolean =>
   !t.tables.appointments.some((a) => VISIT_KINDS.includes(a.kind));
+const customerNamed = (t: Trace, name: string): Row | undefined =>
+  t.tables.customers.find((c) => c.name === name);
+const noCustomerEmailSent = (t: Trace): boolean =>
+  !t.tables.notifications.some((n) => n.audience === "customer");
+// Turn 1 is before the caller has said who they are: the reply must not carry
+// anything from the earlier customer record except, at most, the name.
+const firstReplyLeaksNothing = (t: Trace): boolean =>
+  !/pine|alex@example\.com/i.test(t.turns[0]?.reply ?? "");
 
 // The customer turn (1-based) whose run made a successful book_appointment, or
 // null when nothing was booked.
@@ -300,6 +310,9 @@ const SCENARIO_LIST: Scenario[] = [
       },
     ],
   },
+  // 10 and 11 start with the customer already linked to the lead, which is the
+  // state mid-conversation after a save (a first text from a known number is
+  // 13 and 14). Their meaning is unchanged.
   {
     id: "10",
     title: "efficient-booking",
@@ -373,6 +386,126 @@ const SCENARIO_LIST: Scenario[] = [
           t.tables.notifications.some(
             (n) => n.audience === "customer" && n.template === "booking_customer",
           ),
+      },
+      {
+        description: "the conversation records the customer's consent for that address, with a time",
+        test: (t) =>
+          String(t.tables.conversations[0]?.email_consent_address ?? "").toLowerCase() ===
+            "jane.doe@example.com" && Boolean(t.tables.conversations[0]?.email_consent_at),
+      },
+    ],
+  },
+  {
+    id: "13",
+    title: "returning-same-name",
+    seed: {
+      customer: { name: "Alex Kim", email: "alex@example.com", location: "7 Pine St, 75043" },
+      linked: false,
+    },
+    opening: "My AC needs a repair visit, it stopped cooling this morning, no one vulnerable",
+    persona: {
+      facts:
+        "name Alex Kim, you have used this shop before; when asked whether you are Alex Kim, say yes; your address is 7 Pine St, ZIP 75043; you do not want any email",
+      goal: "get a repair visit booked",
+    },
+    maxTurns: 8,
+    checks: [
+      {
+        description: "a scheduled service_visit appointment exists",
+        test: (t) => scheduled(t, "service_visit").length > 0,
+      },
+      {
+        description: 'the turn 1 reply names "Alex Kim"',
+        test: (t) => (t.turns[0]?.reply ?? "").includes("Alex Kim"),
+      },
+      {
+        description: "the turn 1 reply shows no address and no email",
+        test: firstReplyLeaksNothing,
+      },
+      {
+        description: "still one customer, with its name and email unchanged",
+        test: (t) =>
+          t.tables.customers.length === 1 &&
+          customerNamed(t, "Alex Kim")?.email === "alex@example.com",
+      },
+      {
+        description: "the lead and the appointment are linked to that customer",
+        test: (t) => {
+          const id = customerNamed(t, "Alex Kim")?.id;
+          return (
+            id !== undefined &&
+            t.tables.leads[0]?.customer_id === id &&
+            scheduled(t, "service_visit").some((a) => a.customer_id === id)
+          );
+        },
+      },
+      {
+        description: "no email went to the customer (no consent was given)",
+        test: noCustomerEmailSent,
+      },
+    ],
+  },
+  {
+    id: "14",
+    title: "returning-different-name",
+    seed: {
+      customer: { name: "Alex Kim", email: "alex@example.com", location: "7 Pine St, 75043" },
+      linked: false,
+    },
+    opening: "My AC needs a repair visit, it stopped cooling this morning, no one vulnerable",
+    persona: {
+      facts:
+        "name Dana Ruiz, you share this phone number with someone else; when asked whether you are Alex Kim, say no, you are Dana Ruiz; your address is 40 Maple Dr, ZIP 75044; you do not want any email",
+      goal: "get a repair visit booked",
+    },
+    maxTurns: 8,
+    checks: [
+      {
+        description: "a scheduled service_visit appointment exists",
+        test: (t) => scheduled(t, "service_visit").length > 0,
+      },
+      {
+        description: "the turn 1 reply shows no address and no email",
+        test: firstReplyLeaksNothing,
+      },
+      {
+        description: "two customers; Alex Kim's name and email are untouched",
+        test: (t) =>
+          t.tables.customers.length === 2 &&
+          customerNamed(t, "Alex Kim")?.email === "alex@example.com",
+      },
+      {
+        description: "Dana Ruiz is a new customer with no email",
+        test: (t) => {
+          const dana = customerNamed(t, "Dana Ruiz");
+          return dana !== undefined && dana.email === null && dana.phone === CUSTOMER_NUMBER;
+        },
+      },
+      {
+        description: "the lead and the appointment are linked to Dana Ruiz, not Alex Kim",
+        test: (t) => {
+          const id = customerNamed(t, "Dana Ruiz")?.id;
+          return (
+            id !== undefined &&
+            t.tables.leads[0]?.customer_id === id &&
+            scheduled(t, "service_visit").some((a) => a.customer_id === id)
+          );
+        },
+      },
+      {
+        description: 'the booked visit\'s service location contains "40 Maple Dr"',
+        test: (t) =>
+          scheduled(t, "service_visit").some((a) => {
+            const order = t.tables.work_orders.find((w) => w.id === a.work_order_id);
+            const location = t.tables.service_locations.find(
+              (l) => l.id === order?.service_location_id,
+            );
+            return String(location?.address ?? "").includes("40 Maple Dr");
+          }),
+      },
+      {
+        description: "no email went to the customer (no consent was given)",
+        test: noCustomerEmailSent,
       },
     ],
   },
