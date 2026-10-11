@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "ask": [
+      "PowerShell(git push *)",
+      "PowerShell(gh *)",
+      "PowerShell(npx supabase db push *)",
+      "PowerShell(*.env.local*)",
+      "Bash(git push *)",
+      "Bash(gh *)",
+      "Bash(npx supabase db push *)",
+      "Bash(*.env.local*)",
+      "Read(.env.local)",
+      "Edit(.env.local)"
+    ]
+  }
+}
