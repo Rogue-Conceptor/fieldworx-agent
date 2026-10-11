@@ -1,19 +1,20 @@
 import "server-only";
 
-// Whole-message carrier/compliance keywords. Twilio handles STOP/START/HELP
-// itself; the agent must stay silent on all of them.
-const OPT_KEYWORDS = new Set([
+// Whole-message carrier/compliance keywords, the same lists as the Twilio
+// console. Twilio answers all of them itself; the agent stays silent, and the
+// opt-out and opt-in ones are also recorded per number (see optstatus.ts).
+const OPT_OUT_KEYWORDS = new Set([
   "STOP",
   "STOPALL",
   "UNSUBSCRIBE",
   "CANCEL",
   "END",
   "QUIT",
-  "START",
-  "UNSTOP",
-  "HELP",
-  "INFO",
+  "OPTOUT",
+  "REVOKE",
 ]);
+const OPT_IN_KEYWORDS = new Set(["START", "UNSTOP"]);
+const HELP_KEYWORDS = new Set(["HELP", "INFO"]);
 
 const SAFETY_PHRASES = [
   "gas smell",
@@ -104,21 +105,28 @@ function hasLiveSafetyPhrase(clause: string): boolean {
 // " and ", so a denial never reaches across to a different statement.
 const CLAUSE_BREAK = /[,.;:!?]|\s(?:but|though|however|and)\s/;
 
-export function classifyInbound(body: string): "opt_keyword" | "safety" | "normal" {
+// A keyword kind carries the matched keyword (uppercase, punctuation dropped).
+export type Classification =
+  | { kind: "opt_out" | "opt_in" | "help"; keyword: string }
+  | { kind: "safety" | "normal"; keyword: null };
+
+export function classifyInbound(body: string): Classification {
   // Trim, uppercase, drop trailing punctuation; the WHOLE message must match.
   const normalized = body
     .trim()
     .toUpperCase()
     .replace(/[\s.,!?;:'"`)\]}*_~\-–—‘’“”…]+$/, "");
-  if (OPT_KEYWORDS.has(normalized)) return "opt_keyword";
+  if (OPT_OUT_KEYWORDS.has(normalized)) return { kind: "opt_out", keyword: normalized };
+  if (OPT_IN_KEYWORDS.has(normalized)) return { kind: "opt_in", keyword: normalized };
+  if (HELP_KEYWORDS.has(normalized)) return { kind: "help", keyword: normalized };
 
   // Safety is judged clause by clause so "no smoke, but I smell gas" still
   // alarms while "no gas smell, no smoke" does not. A message whose safety
   // words are all denied is "normal": the model's own Safety rule covers it.
   const lower = body.toLowerCase().replace(/[‘’]/g, "'");
-  if (lower.split(CLAUSE_BREAK).some(hasLiveSafetyPhrase)) return "safety";
+  if (lower.split(CLAUSE_BREAK).some(hasLiveSafetyPhrase)) return { kind: "safety", keyword: null };
 
-  return "normal";
+  return { kind: "normal", keyword: null };
 }
 
 export const SAFETY_TEXT =

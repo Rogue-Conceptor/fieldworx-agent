@@ -21,6 +21,12 @@ import {
   SAFETY_TEXT,
 } from "./keywords";
 import { formatOnFile, loadOnFile } from "./onfile";
+import {
+  isOptedOut,
+  recordOptStatus,
+  type OptSource,
+  type OptStatus,
+} from "./optstatus";
 import { buildSystemPrompt, type AgentProfile } from "./prompt";
 import { sendOutbound } from "./send";
 import { executeTool, TOOL_DEFINITIONS, type ToolContext } from "./tools";
@@ -29,6 +35,7 @@ type Outcome =
   | "replied"
   | "fallback"
   | "skipped_keyword"
+  | "skipped_opted_out"
   | "safety"
   | "superseded"
   | "send_failed"
@@ -63,6 +70,7 @@ const TOOL_RESULT_MAX = 500;
 
 type RunFields = {
   outcome: Outcome;
+  keyword?: string | null;
   outbound_message_id?: string | null;
   model?: string | null;
   input_tokens?: number | null;
@@ -114,6 +122,29 @@ function sendErrorCode(err: unknown): string {
   return maskPhones(message).slice(0, 120);
 }
 
+// Twilio refuses a send to a number that has opted out of this sender.
+const TWILIO_OPTED_OUT_CODE = 21610;
+
+function isTwilioOptedOut(err: unknown): boolean {
+  return Number((err as { code?: unknown } | null)?.code) === TWILIO_OPTED_OUT_CODE;
+}
+
+// Best effort: a failure is logged with a fixed string and never changes what
+// the run does next.
+async function tryRecordOptStatus(
+  supabase: Admin,
+  a: ProcessInboundArgs,
+  status: OptStatus,
+  keyword: string | null,
+  source: OptSource,
+): Promise<void> {
+  try {
+    await recordOptStatus(supabase, a.businessId, a.customerNumber, status, keyword, source);
+  } catch {
+    console.error("[agent] opt status record failed");
+  }
+}
+
 // Inserts one agent_runs row and returns the total latency it recorded.
 async function recordRun(
   supabase: Admin,
@@ -133,6 +164,7 @@ async function recordRun(
     model_latency_ms: null,
     total_latency_ms: totalLatencyMs,
     error_code: null,
+    keyword: null,
     tool_calls: [],
     ...row,
   });
@@ -177,11 +209,14 @@ function bookingConfirmation(
 // Never throws: any unexpected failure is logged (masked) and recorded as an
 // "error" run when possible. `deps` lets a test inject its own clients and
 // listen for events; left out, the real clients are used and events are ignored.
+// `send` replaces sendOutbound, so a test can make a text fail the way Twilio
+// does (sendOutbound itself never throws in log mode).
 export async function processInbound(
   a: ProcessInboundArgs,
   deps?: {
     supabase?: Admin;
     anthropic?: Pick<Anthropic, "messages">;
+    send?: typeof sendOutbound;
     onEvent?: (e: { type: "question_trimmed"; dropped: number }) => void;
   },
 ): Promise<void> {
@@ -189,6 +224,7 @@ export async function processInbound(
   const toolCalls: ToolCallRecord[] = [];
   try {
     const supabase = deps?.supabase ?? createAdminClient();
+    const send = deps?.send ?? sendOutbound;
 
     // 1. business profile -> reply prefix
     const { data: business, error: profileError } = await supabase
@@ -201,20 +237,60 @@ export async function processInbound(
     const prefix =
       profile.program_prefix ?? `${profile.display_name ?? "Message"}:`;
 
-    // 2. carrier keywords get no reply; safety skips the model
-    const kind = classifyInbound(a.inboundBody);
-    if (kind === "opt_keyword") {
-      const total = await recordRun(supabase, a, { outcome: "skipped_keyword" });
+    // 2. carrier keywords get no reply. STOP-type words and START-type words
+    // are also recorded per number; HELP is not.
+    const inbound = classifyInbound(a.inboundBody);
+    if (
+      inbound.kind === "opt_out" ||
+      inbound.kind === "opt_in" ||
+      inbound.kind === "help"
+    ) {
+      if (inbound.kind !== "help") {
+        await tryRecordOptStatus(
+          supabase,
+          a,
+          inbound.kind === "opt_out" ? "opted_out" : "opted_in",
+          inbound.keyword,
+          "keyword",
+        );
+      }
+      const total = await recordRun(supabase, a, {
+        outcome: "skipped_keyword",
+        keyword: inbound.keyword,
+      });
       logRun("skipped_keyword", a.conversationId, total);
+      return;
+    }
+    const kind = inbound.kind; // "safety" skips the model
+
+    // 2a. a number that opted out gets nothing: no opt-in text, no model, no
+    // tools. If the check itself fails the answer is unknown, and an unknown
+    // answer is treated as opted out: nothing is ever sent on a failed check.
+    let optedOut: boolean;
+    let optCheckFailed = false;
+    try {
+      optedOut = await isOptedOut(supabase, a.businessId, a.customerNumber);
+    } catch {
+      console.error("[agent] opt-out check failed");
+      optedOut = true;
+      optCheckFailed = true;
+    }
+    if (optedOut) {
+      const total = await recordRun(supabase, a, {
+        outcome: "skipped_opted_out",
+        error_code: optCheckFailed ? "opt_check_failed" : null,
+      });
+      logRun("skipped_opted_out", a.conversationId, total);
       return;
     }
 
     // 2b. first text of a new conversation: opt-in confirmation, sent exactly
     // as written (not through formatOutbound) and with no agent_runs row of
-    // its own. A failure here must never block the agent's reply.
+    // its own. A failure here must not block the agent's reply, except Twilio
+    // refusing the number as opted out (21610): that ends the run.
     if (a.conversationIsNew) {
       try {
-        const sent = await sendOutbound({
+        const sent = await send({
           to: a.customerNumber,
           from: a.businessNumber,
           body: OPT_IN_TEXT,
@@ -230,7 +306,20 @@ export async function processInbound(
           });
         if (optInStoreError) throw optInStoreError;
       } catch (err) {
-        console.error("[agent] opt-in confirmation failed", shortError(err));
+        // sendErrorCode keeps Twilio's numeric code (shortError shows the HTTP
+        // status instead).
+        console.error("[agent] opt-in confirmation failed", sendErrorCode(err));
+        if (isTwilioOptedOut(err)) {
+          await tryRecordOptStatus(supabase, a, "opted_out", null, "twilio_21610");
+          // The number is opted out, so no reply could reach it: no model, no
+          // tools, no reply send.
+          const total = await recordRun(supabase, a, {
+            outcome: "skipped_opted_out",
+            error_code: String(TWILIO_OPTED_OUT_CODE),
+          });
+          logRun("skipped_opted_out", a.conversationId, total);
+          return;
+        }
       }
     }
 
@@ -462,7 +551,7 @@ export async function processInbound(
     let sid: string | null = null;
     let sendFailed = false;
     try {
-      const sent = await sendOutbound({
+      const sent = await send({
         to: a.customerNumber,
         from: a.businessNumber,
         body: replyText,
@@ -472,6 +561,9 @@ export async function processInbound(
       sendFailed = true;
       outcome = "send_failed";
       errorCode = sendErrorCode(err);
+      if (isTwilioOptedOut(err)) {
+        await tryRecordOptStatus(supabase, a, "opted_out", null, "twilio_21610");
+      }
     }
 
     // 6. store the outbound message (never after a failed send)

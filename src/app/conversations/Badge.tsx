@@ -17,6 +17,8 @@ export function outcomeTone(outcome: string): Tone {
       return "green";
     case "safety":
       return "orange";
+    case "skipped_opted_out":
+      return "blue";
     case "fallback":
     case "error":
     case "send_failed":

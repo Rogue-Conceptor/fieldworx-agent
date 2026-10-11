@@ -1,8 +1,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 // In-memory stand-in for the Supabase client, covering the query shapes that
 // processInbound and the agent tools use. It is not Postgres: no RLS, no
-// foreign keys, no triggers. The one database rule it does enforce is the
-// unique scheduled-slot index on appointments.
+// foreign keys, no triggers. The database rules it does enforce are the unique
+// scheduled-slot index on appointments and, for sms_opt_status upserts, the
+// table's check constraints (status, source, E.164 phone).
 
 export type Row = Record<string, any>;
 export type DbError = { message: string; code?: string };
@@ -19,6 +20,7 @@ export const TABLES = [
   "work_orders",
   "notifications",
   "audit_log",
+  "sms_opt_status",
 ] as const;
 
 // Tables with an updated_at column that a trigger maintains in the real schema.
@@ -30,6 +32,7 @@ const HAS_UPDATED_AT = new Set([
   "conversations",
   "appointments",
   "work_orders",
+  "sms_opt_status",
 ]);
 
 const TIMESTAMPTZ_COLUMNS = ["starts_at", "ends_at", "scheduled_at"];
@@ -86,11 +89,13 @@ function predicatesFromOr(expr: string): Predicate[] {
   });
 }
 
-// One insert/update/delete attempt: what was written and the error code (or
-// message) if it failed.
+export type WriteOp = "insert" | "update" | "delete" | "upsert";
+
+// One insert/update/delete/upsert attempt: what was written and the error code
+// (or message) if it failed.
 export type WriteLogEntry = {
   table: string;
-  op: "insert" | "update" | "delete";
+  op: WriteOp;
   payload: any;
   error: string | null;
 };
@@ -106,8 +111,9 @@ export class FakeSupabase {
   private forcedFailures: { table: string; op: string; error: DbError }[] = [];
   private insertHooks = new Map<string, (input: Row) => void>();
 
-  // The next `op` on `table` fails with `error` and changes nothing.
-  failNext(table: string, op: "insert" | "update" | "delete", error: DbError): void {
+  // The next `op` on `table` fails with `error` and changes nothing. A failed
+  // "select" is not added to `log` (the log holds writes only).
+  failNext(table: string, op: WriteOp | "select", error: DbError): void {
     this.forcedFailures.push({ table, op, error });
   }
 
@@ -128,12 +134,7 @@ export class FakeSupabase {
     return hook;
   }
 
-  recordWrite(
-    table: string,
-    op: "insert" | "update" | "delete",
-    payload: any,
-    error: DbError | null,
-  ): void {
+  recordWrite(table: string, op: WriteOp, payload: any, error: DbError | null): void {
     this.log.push({
       table,
       op,
@@ -211,10 +212,24 @@ const UNIQUE_VIOLATION: DbError = {
   message: 'duplicate key value violates unique constraint "uq_appointments_one_per_slot"',
 };
 
+// The check constraints on sms_opt_status (migration 20261011220000).
+const E164 = /^\+[1-9][0-9]{6,14}$/;
+function optStatusViolation(row: Row): DbError | null {
+  const bad =
+    !["opted_out", "opted_in"].includes(row.status) ||
+    !["keyword", "twilio_21610"].includes(row.source) ||
+    typeof row.phone !== "string" ||
+    !E164.test(row.phone);
+  return bad
+    ? { code: "23514", message: "new row for relation sms_opt_status violates check constraint" }
+    : null;
+}
+
 class Query {
-  private op: "select" | "insert" | "update" | "delete" = "select";
+  private op: "select" | WriteOp = "select";
   private columns: string[] | null = null;
   private payload: any;
+  private conflictColumns: string[] = ["id"];
   private filters: Predicate[] = [];
   private ordering: { column: string; ascending: boolean }[] = [];
   private rowLimit: number | null = null;
@@ -240,6 +255,14 @@ class Query {
   update(payload: any): this {
     this.op = "update";
     this.payload = payload;
+    return this;
+  }
+  // Insert, or on a match of `onConflict` (comma-separated columns) merge the
+  // given columns into the existing row; columns left out are kept.
+  upsert(payload: any, options?: { onConflict?: string }): this {
+    this.op = "upsert";
+    this.payload = payload;
+    if (options?.onConflict) this.conflictColumns = options.onConflict.split(",").map((c) => c.trim());
     return this;
   }
   delete(): this {
@@ -307,6 +330,8 @@ class Query {
     const rows = db.tables[table];
 
     if (this.op === "select") {
+      const forcedSelect = db.takeForcedFailure(table, "select");
+      if (forcedSelect) return { data: null, error: forcedSelect };
       let found = rows.filter((r) => this.matches(r));
       for (const { column, ascending } of [...this.ordering].reverse()) {
         found = [...found].sort((x, y) => {
@@ -342,6 +367,34 @@ class Query {
       }
       db.recordWrite(table, "insert", this.payload, null);
       return { data: this.returning ? inserted.map((r) => this.project(r)) : null, error: null };
+    }
+
+    if (this.op === "upsert") {
+      const written: Row[] = [];
+      for (const input of Array.isArray(this.payload) ? this.payload : [this.payload]) {
+        const existing = rows.find((r) =>
+          this.conflictColumns.every((c) => sameValue(r[c], input[c]) && input[c] != null),
+        );
+        const candidate = { ...(existing ?? {}), ...structuredClone(input) };
+        if (table === "sms_opt_status") {
+          const error = optStatusViolation(candidate);
+          if (error) {
+            db.recordWrite(table, "upsert", this.payload, error);
+            return { data: null, error };
+          }
+        }
+        if (existing) {
+          Object.assign(existing, candidate);
+          if (HAS_UPDATED_AT.has(table)) existing.updated_at = db.nextTimestamp();
+          written.push(existing);
+        } else {
+          const row = db.build(table, input);
+          rows.push(row);
+          written.push(row);
+        }
+      }
+      db.recordWrite(table, "upsert", this.payload, null);
+      return { data: this.returning ? written.map((r) => this.project(r)) : null, error: null };
     }
 
     if (this.op === "update") {

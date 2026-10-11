@@ -21,7 +21,7 @@ function section(title: string) {
   console.log(`\n== ${title} ==`);
 }
 
-type Class = "opt_keyword" | "safety" | "normal";
+type Kind = "opt_out" | "opt_in" | "help" | "safety" | "normal";
 
 async function main() {
   // The agent modules read these two settings when they are first imported.
@@ -48,8 +48,15 @@ async function main() {
 
   // ------------------------------------------------------------------
   section("classifyInbound: negation-aware safety (this round, 6 new cases)");
-  const cls = (input: string, expected: Class) =>
-    check(`classifyInbound(${JSON.stringify(input)}) -> ${expected}`, classifyInbound(input) === expected, classifyInbound(input));
+  // `keyword` is the matched keyword for the three keyword kinds, null otherwise.
+  const cls = (input: string, expected: Kind, keyword: string | null = null) => {
+    const got = classifyInbound(input);
+    check(
+      `classifyInbound(${JSON.stringify(input)}) -> ${expected}${keyword ? ` (${keyword})` : ""}`,
+      got.kind === expected && got.keyword === keyword,
+      got,
+    );
+  };
   cls("There's no heat and I smell gas", "safety");
   cls("I don't have heat I smell gas", "safety");
   cls("No burning smell or smoke", "normal");
@@ -68,14 +75,14 @@ async function main() {
   cls("I smell gas in the kitchen", "safety");
   cls("smoke coming from the outside unit", "safety");
   cls("it's burning up in here and the AC is out", "normal");
-  cls("STOP", "opt_keyword");
+  cls("STOP", "opt_out", "STOP");
   cls("yes", "normal");
 
   section("classifyInbound: earlier cases (reconstructed from docs/TESTING_INITIATIVES.md line 87)");
-  cls("STOP", "opt_keyword");
-  cls("stop.", "opt_keyword");
-  cls("Help", "opt_keyword");
-  cls("cancel", "opt_keyword");
+  cls("STOP", "opt_out", "STOP");
+  cls("stop.", "opt_out", "STOP");
+  cls("Help", "help", "HELP");
+  cls("cancel", "opt_out", "CANCEL");
   cls("yes", "normal");
   cls("Yes, Tuesday works", "normal");
   cls("please stop by tomorrow", "normal");
@@ -85,6 +92,20 @@ async function main() {
   cls("my carbon monoxide alarm is going off", "safety");
   cls("there is smoke coming from the vent", "safety");
   cls("sparks coming from the panel", "safety");
+
+  section("classifyInbound: the 12 carrier keywords (kind and matched keyword)");
+  for (const k of ["STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT", "OPTOUT", "REVOKE"]) cls(k, "opt_out", k);
+  for (const k of ["START", "UNSTOP"]) cls(k, "opt_in", k);
+  for (const k of ["HELP", "INFO"]) cls(k, "help", k);
+
+  section("classifyInbound: keyword normalization (trim, case, trailing punctuation) and near-misses");
+  cls("stop.", "opt_out", "STOP");
+  cls("Revoke!", "opt_out", "REVOKE");
+  cls("  unstop  ", "opt_in", "UNSTOP");
+  cls("Info?", "help", "INFO");
+  cls("(STOP)", "normal");
+  cls("stop all", "normal");
+  cls("please stop", "normal");
 
   // ------------------------------------------------------------------
   section("formatOutbound / stripForHistory (earlier cases, reconstructed)");

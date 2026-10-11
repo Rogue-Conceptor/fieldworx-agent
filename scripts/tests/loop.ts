@@ -105,6 +105,41 @@ function firstOfferedSlot(snap: Snapshot): { start: string; label: string } {
   throw new Error("no slots in the transcript");
 }
 
+// ------------------------------------------------------------- fake sending
+
+type SendArgs = { to: string; from: string; body: string };
+
+// Stands in for sendOutbound: records every text it is asked to send, and
+// `failWith(callNumber)` (1-based) may return an error to throw instead.
+type Sender = {
+  calls: SendArgs[];
+  send: (args: SendArgs) => Promise<{ sid: string | null; sent: boolean }>;
+};
+function fakeSender(failWith?: (callNumber: number) => Error | null): Sender {
+  const calls: SendArgs[] = [];
+  return {
+    calls,
+    send: async (args) => {
+      calls.push(args);
+      const error = failWith?.(calls.length);
+      if (error) throw error;
+      return { sid: null, sent: false };
+    },
+  };
+}
+
+// What the Twilio SDK throws on a failed send: an HTTP status and a numeric code.
+class RestException extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+const twilioOptedOut = () => new RestException(400, 21610, "[HTTP 400] Unable to create record: Attempt to send to unsubscribed recipient");
+
 // ------------------------------------------------------------------ test kit
 
 type Fact = { name: string; ok: boolean; actual?: unknown };
@@ -264,7 +299,9 @@ async function main() {
 
   // Runs one inbound message through the agent with the fake model; the agent's
   // own console output is captured so it can be inspected instead of printed.
-  async function run(db: FakeSupabase, args: InboundArgs, script: Step[]) {
+  // `send` stands in for the Twilio send (log mode never throws); left out, the
+  // agent's own sendOutbound runs.
+  async function run(db: FakeSupabase, args: InboundArgs, script: Step[], send?: Sender["send"]) {
     const model = new FakeAnthropic(script);
     const lines: string[] = [];
     const events: unknown[] = [];
@@ -279,6 +316,7 @@ async function main() {
       await processInbound(args, {
         supabase: db as never,
         anthropic: model as never,
+        send,
         onEvent: (e) => events.push(e),
       });
     } finally {
@@ -700,6 +738,210 @@ async function main() {
     same("same corrected address in other letter case: already_sent", [results[2].confirmation_email, results[2].confirmations_sent], ["already_sent", 0]);
     same("customer notifications went to each address once", customerMail(db).map((n) => n.recipient), ["pat@typo.example", "pat@example.com"]);
     same("consent follows the corrected address; the case-only change writes nothing", [t.conversations[0].email_consent_address, consentWrites(db).length], ["pat@example.com", 2]);
+  });
+
+  // ---- opt-out status per number (fix E) ----
+
+  const optRows = (db: FakeSupabase) => db.tables.sms_opt_status;
+  // The same inbound with a different text (and any other field changed).
+  const say = (args: InboundArgs, body: string, extra: Partial<InboundArgs> = {}): InboundArgs => ({ ...args, inboundBody: body, ...extra });
+  // Every write attempt, as "table:op", in order.
+  const writesAfter = (db: FakeSupabase, from = 0) => db.log.slice(from).map((l) => `${l.table}:${l.op}`);
+  const NORMAL_TEXT = "My AC stopped cooling";
+  const MODEL_REPLY = "Happy to help. What is the AC doing?";
+  const NEVER = "this must never be requested";
+  const optColumns = (db: FakeSupabase) => optRows(db).map((r) => [r.business_id, r.phone, r.status, r.last_keyword ?? null, r.source]);
+  const runColumns = (db: FakeSupabase) => db.tables.agent_runs.map((r) => [r.outcome, r.keyword ?? null, r.error_code]);
+  const { OPT_IN_TEXT } = await import("../../src/lib/agent/keywords");
+
+  await testCase("24  STOP -> opted_out row, run skipped_keyword with the keyword, nothing sent", async () => {
+    const { db, args } = world();
+    const sender = fakeSender();
+    const { model, lines } = await run(db, say(args, "STOP", { conversationIsNew: true }), [], sender.send);
+    same("one opt row: this business and number, opted_out, last keyword STOP, source keyword", optColumns(db), [[BIZ, PHONE, "opted_out", "STOP", "keyword"]]);
+    same("one run row: skipped_keyword, keyword STOP, no error_code", runColumns(db), [["skipped_keyword", "STOP", null]]);
+    same("no model call", model.calls.length, 0);
+    same("no text sent (not even the opt-in text, though the conversation is new)", sender.calls.length, 0);
+    same("no outbound message stored", outbound(db).length, 0);
+    same("the only writes: the opt row, then the run row", writesAfter(db), ["sms_opt_status:upsert", "agent_runs:insert"]);
+    same("no tool calls recorded", db.tables.agent_runs[0].tool_calls, []);
+    same("no log line contains the phone number", leakedFrom(lines, [PHONE]), []);
+  });
+
+  await testCase("25  START after STOP -> the same row flips to opted_in", async () => {
+    const { db, args } = world();
+    const sender = fakeSender();
+    await run(db, say(args, "STOP"), [], sender.send);
+    const first = structuredClone(optRows(db)[0]);
+    const { model } = await run(db, say(args, "start", { inboundMessageId: "inb-3" }), [], sender.send);
+    same("still one opt row", optRows(db).length, 1);
+    same("same row (id and created_at unchanged), updated_at moved forward", [optRows(db)[0].id === first.id, optRows(db)[0].created_at === first.created_at, optRows(db)[0].updated_at > first.updated_at], [true, true, true]);
+    same("now opted_in, last keyword START, source keyword", optColumns(db), [[BIZ, PHONE, "opted_in", "START", "keyword"]]);
+    same("both runs skipped_keyword, each with its keyword", runColumns(db), [["skipped_keyword", "STOP", null], ["skipped_keyword", "START", null]]);
+    same("no model call, no text sent", [model.calls.length, sender.calls.length], [0, 0]);
+  });
+
+  await testCase("26  HELP and INFO -> no opt row, skipped_keyword with the keyword", async () => {
+    for (const word of ["HELP", "INFO"]) {
+      const { db, args } = world();
+      const sender = fakeSender();
+      const { model } = await run(db, say(args, word, { conversationIsNew: true }), [], sender.send);
+      same(`${word}: no opt row and no write to sms_opt_status`, [optRows(db).length, db.log.filter((l) => l.table === "sms_opt_status").length], [0, 0]);
+      same(`${word}: run skipped_keyword with the keyword`, runColumns(db), [["skipped_keyword", word, null]]);
+      same(`${word}: no model call, no text sent`, [model.calls.length, sender.calls.length], [0, 0]);
+    }
+    const { db, args } = world();
+    const sender = fakeSender();
+    await run(db, say(args, "STOP"), [], sender.send);
+    await run(db, say(args, "HELP", { inboundMessageId: "inb-3" }), [], sender.send);
+    same("HELP after STOP leaves the opt-out as it was", optColumns(db), [[BIZ, PHONE, "opted_out", "STOP", "keyword"]]);
+  });
+
+  await testCase("27  normal text after STOP -> skipped_opted_out; no model, no opt-in text, no send, no writes", async () => {
+    const { db, args } = world();
+    const sender = fakeSender();
+    await run(db, say(args, "STOP"), [], sender.send);
+    const logged = db.log.length;
+    const { model, lines } = await run(db, say(args, NORMAL_TEXT, { conversationIsNew: true, inboundMessageId: "inb-3" }), [textStep(NEVER)], sender.send);
+    const second = db.tables.agent_runs[1];
+    same("run: skipped_opted_out, no keyword, no error_code, no model, no tool calls", [second.outcome, second.keyword ?? null, second.error_code, second.model, second.tool_calls], ["skipped_opted_out", null, null, null, []]);
+    same("no model call", model.calls.length, 0);
+    same("no text sent (no opt-in text either, though the conversation is new)", sender.calls.length, 0);
+    same("no outbound message stored", outbound(db).length, 0);
+    same("the only write is the run row (no lead, customer, appointment or notification writes)", writesAfter(db, logged), ["agent_runs:insert"]);
+    same("the opt row is untouched", optColumns(db), [[BIZ, PHONE, "opted_out", "STOP", "keyword"]]);
+    same("no log line contains the phone number", leakedFrom(lines, [PHONE]), []);
+  });
+
+  await testCase("27b safety text after STOP -> also skipped_opted_out", async () => {
+    const { db, args } = world();
+    const sender = fakeSender();
+    await run(db, say(args, "STOP"), [], sender.send);
+    const logged = db.log.length;
+    const { model } = await run(db, say(args, "I smell gas in the kitchen", { conversationIsNew: true, inboundMessageId: "inb-3" }), [textStep(NEVER)], sender.send);
+    same("run: skipped_opted_out", db.tables.agent_runs[1].outcome, "skipped_opted_out");
+    same("no model call, no text sent, nothing stored", [model.calls.length, sender.calls.length, outbound(db).length], [0, 0, 0]);
+    same("the only write is the run row", writesAfter(db, logged), ["agent_runs:insert"]);
+  });
+
+  await testCase("28  opt check fails (DB error) -> skipped_opted_out, opt_check_failed, nothing sent", async () => {
+    const { db, args } = world();
+    const sender = fakeSender();
+    db.failNext("sms_opt_status", "select", { message: "boom", code: "XX000" });
+    const { model, lines } = await run(db, say(args, NORMAL_TEXT, { conversationIsNew: true }), [textStep(NEVER)], sender.send);
+    same("no opt row exists, yet the run is skipped_opted_out with error_code opt_check_failed", runColumns(db), [["skipped_opted_out", null, "opt_check_failed"]]);
+    same("no model call", model.calls.length, 0);
+    same("no text sent (no opt-in text either)", sender.calls.length, 0);
+    same("no outbound message stored", outbound(db).length, 0);
+    same("the only write is the run row", writesAfter(db), ["agent_runs:insert"]);
+    fact('fixed log line "[agent] opt-out check failed" written', lines.includes("[agent] opt-out check failed"), lines);
+    same("no log line contains the phone number or the DB error text", leakedFrom(lines, [PHONE, "boom"]), []);
+  });
+
+  await testCase("29  reply send throws 21610 -> opted_out recorded (twilio_21610); the next text is skipped", async () => {
+    const { db, args } = world();
+    const refused = fakeSender(() => twilioOptedOut());
+    const { lines } = await run(db, args, [textStep(MODEL_REPLY)], refused.send);
+    same("the reply was attempted once", refused.calls.length, 1);
+    same("opt row: opted_out, no keyword, source twilio_21610", optColumns(db), [[BIZ, PHONE, "opted_out", null, "twilio_21610"]]);
+    same("run: send_failed with error_code 21610", runColumns(db), [["send_failed", null, "21610"]]);
+    same("no outbound message stored", outbound(db).length, 0);
+    same("no log line contains the phone number", leakedFrom(lines, [PHONE]), []);
+
+    const later = fakeSender();
+    const { model } = await run(db, say(args, "hello again", { inboundMessageId: "inb-3" }), [textStep(NEVER)], later.send);
+    same("the next text: skipped_opted_out, no model call, nothing sent", [db.tables.agent_runs[1].outcome, model.calls.length, later.calls.length], ["skipped_opted_out", 0, 0]);
+  });
+
+  await testCase("30  opt-in text send throws 21610 -> opted_out recorded; the log line keeps the code", async () => {
+    const { db, args } = world();
+    const sender = fakeSender((n) => (n === 1 ? twilioOptedOut() : null));
+    const { lines } = await run(db, say(args, NORMAL_TEXT, { conversationIsNew: true }), [textStep(MODEL_REPLY)], sender.send);
+    same("the first text sent was the opt-in text", sender.calls[0]?.body, OPT_IN_TEXT);
+    same("opt row: opted_out, no keyword, source twilio_21610", optColumns(db), [[BIZ, PHONE, "opted_out", null, "twilio_21610"]]);
+    fact('log line "[agent] opt-in confirmation failed 21610" written (the code, not the HTTP status)', lines.includes("[agent] opt-in confirmation failed 21610"), lines);
+    same("no log line contains the phone number", leakedFrom(lines, [PHONE]), []);
+  });
+
+  await testCase("31  send errors other than 21610 record nothing", async () => {
+    const errors = [new RestException(400, 30008, "Unknown error"), new Error("socket hang up")];
+    for (const isNew of [true, false]) {
+      for (const error of errors) {
+        const { db, args } = world();
+        const sender = fakeSender(() => error);
+        const { lines } = await run(db, say(args, NORMAL_TEXT, { conversationIsNew: isNew }), [textStep(MODEL_REPLY)], sender.send);
+        const label = `${isNew ? "opt-in text and reply" : "reply"} fail with ${error instanceof RestException ? error.code : error.message}`;
+        same(`${label}: no opt row, no write to sms_opt_status`, [optRows(db).length, db.log.filter((l) => l.table === "sms_opt_status").length], [0, 0]);
+        if (isNew && error instanceof RestException) {
+          fact('opt-in log line keeps the code: "[agent] opt-in confirmation failed 30008"', lines.includes("[agent] opt-in confirmation failed 30008"), lines);
+        }
+        // Today's behavior for any other error: the failed opt-in text is logged and the run goes on to the reply.
+        same(`${label}: the run carried on (${isNew ? "opt-in text, then reply" : "reply"} attempted)`, sender.calls.length, isNew ? 2 : 1);
+        same(`${label}: the run ended as send_failed, not skipped_opted_out`, db.tables.agent_runs.map((r) => r.outcome), ["send_failed"]);
+      }
+    }
+  });
+
+  await testCase("32  REVOKE and OPTOUT -> opted_out", async () => {
+    for (const word of ["REVOKE", "OPTOUT"]) {
+      const { db, args } = world();
+      const sender = fakeSender();
+      await run(db, say(args, word), [], sender.send);
+      same(`${word}: opt row opted_out with that keyword`, optColumns(db), [[BIZ, PHONE, "opted_out", word, "keyword"]]);
+      same(`${word}: run skipped_keyword with the keyword`, runColumns(db), [["skipped_keyword", word, null]]);
+    }
+  });
+
+  await testCase("33  normal text after START -> the agent runs as normal", async () => {
+    const { db, args } = world();
+    const sender = fakeSender();
+    await run(db, say(args, "STOP"), [], sender.send);
+    await run(db, say(args, "START", { inboundMessageId: "inb-3" }), [], sender.send);
+    // The real inbound message (inb-1) is the newest, so the reply is not superseded.
+    const { model } = await run(db, say(args, NORMAL_TEXT, { conversationIsNew: true }), [textStep(MODEL_REPLY)], sender.send);
+    same("the model was called once", model.calls.length, 1);
+    same("run: replied", db.tables.agent_runs[2].outcome, "replied");
+    fact("two texts sent: the opt-in text, then the reply", sender.calls.length === 2 && sender.calls[0].body === OPT_IN_TEXT && sender.calls[1].body.includes(MODEL_REPLY), sender.calls);
+    same("the opt row stays opted_in", optColumns(db), [[BIZ, PHONE, "opted_in", "START", "keyword"]]);
+  });
+
+  await testCase("34  opt rows for another number or another business do not block this one", async () => {
+    const { db, args } = world();
+    seed(db, "sms_opt_status", { business_id: BIZ, phone: "+15555550111", status: "opted_out", last_keyword: "STOP", source: "keyword" });
+    seed(db, "sms_opt_status", { business_id: "biz-other", phone: PHONE, status: "opted_out", last_keyword: "STOP", source: "keyword" });
+    const sender = fakeSender();
+    const { model } = await run(db, args, [textStep(MODEL_REPLY)], sender.send);
+    same("the model was called once and the run replied", [model.calls.length, db.tables.agent_runs[0].outcome], [1, "replied"]);
+    same("the reply was sent", sender.calls.length, 1);
+  });
+
+  await testCase("35  the opt row cannot be written -> logged with a fixed string; the run is still skipped", async () => {
+    const { db, args } = world();
+    const sender = fakeSender();
+    db.failNext("sms_opt_status", "upsert", { message: "boom", code: "XX000" });
+    const { model, lines } = await run(db, say(args, "STOP", { conversationIsNew: true }), [], sender.send);
+    same("run: skipped_keyword with keyword STOP", runColumns(db), [["skipped_keyword", "STOP", null]]);
+    same("no opt row", optRows(db).length, 0);
+    same("no model call, no text sent", [model.calls.length, sender.calls.length], [0, 0]);
+    fact('fixed log line "[agent] opt status record failed" written', lines.includes("[agent] opt status record failed"), lines);
+    same("no log line contains the phone number or the DB error text", leakedFrom(lines, [PHONE, "boom"]), []);
+  });
+
+  await testCase("36  opt-in text refused with 21610 -> the run ends: skipped_opted_out, error_code 21610, no model, no tools, no reply", async () => {
+    const { db, args } = world();
+    // Only the first send (the opt-in text) is refused; a second send would succeed,
+    // so a run that carried on to the reply would show up in sender.calls.
+    const sender = fakeSender((n) => (n === 1 ? twilioOptedOut() : null));
+    const { model, lines } = await run(db, say(args, NORMAL_TEXT, { conversationIsNew: true }), [textStep(NEVER)], sender.send);
+    same("only the opt-in text was attempted: no reply send", sender.calls.map((c) => c.body), [OPT_IN_TEXT]);
+    same("opt row: opted_out, no keyword, source twilio_21610", optColumns(db), [[BIZ, PHONE, "opted_out", null, "twilio_21610"]]);
+    same("one run row: skipped_opted_out, no keyword, error_code 21610", runColumns(db), [["skipped_opted_out", null, "21610"]]);
+    same("no model call", model.calls.length, 0);
+    same("run row: no model recorded, no tool calls", [db.tables.agent_runs[0].model, db.tables.agent_runs[0].tool_calls], [null, []]);
+    same("no outbound message stored", outbound(db).length, 0);
+    same("the only writes: the opt row, then the run row (no tool, lead or customer writes)", writesAfter(db), ["sms_opt_status:upsert", "agent_runs:insert"]);
+    fact('opt-in log line keeps the code: "[agent] opt-in confirmation failed 21610"', lines.includes("[agent] opt-in confirmation failed 21610"), lines);
+    same("no log line contains the phone number", leakedFrom(lines, [PHONE]), []);
   });
 
   // ---------------------------------------------------------------------------
