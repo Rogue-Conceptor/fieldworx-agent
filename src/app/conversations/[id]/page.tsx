@@ -154,7 +154,8 @@ function RunTrace({ run }: { run: Run }) {
   );
 }
 
-export default async function ConversationPage({ params }: { params: { id: string } }) {
+export default async function ConversationPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
   const supabase = await createClient();
   const {
     data: { user },
@@ -180,7 +181,7 @@ export default async function ConversationPage({ params }: { params: { id: strin
   const { data: conversationData, error: conversationError } = await supabase
     .from("conversations")
     .select("id, customer_number, status, created_at, updated_at, lead_id")
-    .eq("id", params.id)
+    .eq("id", id)
     .maybeSingle();
   if (conversationError?.code === "22P02" || (!conversationError && !conversationData)) {
     notFound();
