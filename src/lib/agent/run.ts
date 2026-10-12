@@ -217,7 +217,11 @@ export async function processInbound(
     supabase?: Admin;
     anthropic?: Pick<Anthropic, "messages">;
     send?: typeof sendOutbound;
-    onEvent?: (e: { type: "question_trimmed"; dropped: number }) => void;
+    onEvent?: (e: {
+      type: "question_trimmed";
+      reason: "extra_question" | "compound_question";
+      dropped: number;
+    }) => void;
   },
 ): Promise<void> {
   // Declared outside the try so an error run still records the tools that ran.
@@ -517,7 +521,15 @@ export async function processInbound(
         replyText = formatted.body;
         if (formatted.questionsDropped > 0) {
           console.log(`[agent] trimmed ${formatted.questionsDropped} extra question(s)`);
-          deps?.onEvent?.({ type: "question_trimmed", dropped: formatted.questionsDropped });
+          deps?.onEvent?.({
+            type: "question_trimmed",
+            reason: "extra_question",
+            dropped: formatted.questionsDropped,
+          });
+        }
+        if (formatted.compoundCut) {
+          console.log("[agent] cut a compound question");
+          deps?.onEvent?.({ type: "question_trimmed", reason: "compound_question", dropped: 1 });
         }
       }
 

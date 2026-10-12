@@ -56,6 +56,7 @@ type RunResult = {
   turnsUsed: number; // customer texts sent to the agent
   turnsToBooking: number | null; // the customer turn whose run booked, or null
   questionsTrimmed: number; // extra questions the guardrail cut, across the run
+  compoundCuts: number; // times the guardrail cut a question at a joining "and", across the run
   ended: Ended;
   trace: Trace;
 };
@@ -98,6 +99,7 @@ async function main() {
   }
   const { processInbound } = await import("../../src/lib/agent/run");
   const { stripForHistory } = await import("../../src/lib/agent/format");
+  const { findCompoundQuestions } = await import("../../src/lib/agent/questions");
   const { default: Anthropic } = await import("@anthropic-ai/sdk");
   const client = new Anthropic({ timeout: config.CLAUDE_TIMEOUT_MS, maxRetries: 1 });
 
@@ -154,6 +156,7 @@ async function main() {
       // The agent's own log lines are kept with the turn instead of printed.
       const logs: string[] = [];
       let questionsTrimmed = 0;
+      let compoundCuts = 0;
       const original = { log: console.log, error: console.error, warn: console.warn };
       const capture = (...args: unknown[]) => {
         logs.push(
@@ -180,7 +183,9 @@ async function main() {
             supabase: db as never,
             anthropic: client,
             onEvent: (e) => {
-              if (e.type === "question_trimmed") questionsTrimmed += e.dropped;
+              if (e.type !== "question_trimmed") return;
+              if (e.reason === "compound_question") compoundCuts += 1;
+              else questionsTrimmed += e.dropped;
             },
           },
         );
@@ -217,6 +222,7 @@ async function main() {
         totalLatencyMs: agentRun?.total_latency_ms ?? null,
         customerNext: null,
         questionsTrimmed,
+        compoundCuts,
         logs,
       };
       turns.push(turn);
@@ -266,6 +272,19 @@ async function main() {
       }
     });
 
+    // Applied to every reply in every scenario: no sentence may join two
+    // questions with "and". The failed check quotes the sentence.
+    const compound = turns.flatMap((t, i) =>
+      findCompoundQuestions(t.reply ?? "").map((s) => `turn ${i + 1}: "${s}"`),
+    );
+    checks.push({
+      description:
+        compound.length === 0
+          ? "no reply joins two questions with and"
+          : `a reply joins two questions with and: ${redact(compound.join("; "))}`,
+      passed: compound.length === 0,
+    });
+
     return {
       run,
       passed: checks.every((c) => c.passed),
@@ -276,6 +295,7 @@ async function main() {
       turnsUsed: turns.length,
       turnsToBooking: bookingTurn(trace),
       questionsTrimmed: turns.reduce((n, t) => n + t.questionsTrimmed, 0),
+      compoundCuts: turns.reduce((n, t) => n + t.compoundCuts, 0),
       ended,
       trace,
     };
@@ -304,6 +324,7 @@ async function main() {
           turnsUsed: 0,
           turnsToBooking: null,
           questionsTrimmed: 0,
+          compoundCuts: 0,
           ended: "no_reply",
           trace: { turns: [], ended: "no_reply", tables: {} },
         });
@@ -366,6 +387,13 @@ async function main() {
     `Total: ${all.length} scenarios x ${repeat} run${repeat === 1 ? "" : "s"} = ${allRuns.length} runs, ${passedRuns} passed, ${allRuns.length - passedRuns} failed, ` +
       `${sum(allRuns, (r) => r.ms)} ms, ${sum(allRuns, (r) => r.inputTokens)}/${sum(allRuns, (r) => r.outputTokens)} agent tokens in/out`,
   );
+  const cutRuns = allRuns.filter((r) => r.compoundCuts > 0);
+  console.log(
+    `compound_question backstop: fired ${sum(allRuns, (r) => r.compoundCuts)} times in ${cutRuns.length} of ${allRuns.length} runs` +
+      (cutRuns.length > 0
+        ? ` (${all.flatMap((s) => (s.runs.some((r) => r.compoundCuts > 0) ? [`${s.scenario.id}: ${sum(s.runs, (r) => r.compoundCuts)}`] : [])).join(", ")})`
+        : ""),
+  );
 
   // ---- one failing run per scenario, turn by turn ----
   for (const { scenario, runs } of all) {
@@ -420,6 +448,7 @@ async function main() {
             turnsUsed: r.turnsUsed,
             turnsToBooking: r.turnsToBooking,
             questionsTrimmed: r.questionsTrimmed,
+            compoundCuts: r.compoundCuts,
             ended: r.ended,
             turns: r.trace.turns,
             tables: r.trace.tables,

@@ -29,6 +29,9 @@ export type TurnTrace = {
   customerNext: string | null;
   // Extra questions the one-question guardrail cut from this turn's reply.
   questionsTrimmed: number;
+  // 1 when the guardrail shortened the kept question at an "and" that joined a
+  // second question (reason compound_question), else 0.
+  compoundCuts: number;
   logs: string[]; // console output the agent produced during this turn
 };
 
@@ -250,7 +253,10 @@ const SCENARIO_LIST: Scenario[] = [
             (a) => a.work_order_id && t.tables.work_orders.some((w) => w.id === a.work_order_id),
           ),
       },
-      bookedByTurn(5),
+      // 6, not 5: the one-question rule (fix D) costs one turn. The triage
+      // questions "is it running?" and "is anyone vulnerable?" are now asked in
+      // separate messages instead of one.
+      bookedByTurn(6),
       bookingRunToolCalls(2, "the booking run made at most 2 tool calls"),
     ],
   },

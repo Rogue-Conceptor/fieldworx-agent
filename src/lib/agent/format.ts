@@ -1,5 +1,6 @@
 import "server-only";
 import { MAX_REPLY_CHARS } from "./config";
+import { cutJoinedQuestion } from "./questions";
 
 export const STOP_SUFFIX = "Reply STOP to opt out.";
 
@@ -48,10 +49,13 @@ function splitSentences(text: string): string[] {
 
 // At most one question per text: every sentence that does not end in "?" stays,
 // the first one that does stays, and later question sentences are dropped.
-// What is kept keeps its order and is rejoined with single spaces.
-export function limitQuestions(text: string): { text: string; dropped: number } {
+// What is kept keeps its order and is rejoined with single spaces. The kept
+// question is also cut where it joins a second question with "and" (see
+// cutJoinedQuestion); `cut` says whether that happened.
+export function limitQuestions(text: string): { text: string; dropped: number; cut: boolean } {
   let seenQuestion = false;
   let dropped = 0;
+  let cut = false;
   const kept: string[] = [];
   for (const sentence of splitSentences(text)) {
     if (sentence.endsWith("?")) {
@@ -60,19 +64,27 @@ export function limitQuestions(text: string): { text: string; dropped: number } 
         continue;
       }
       seenQuestion = true;
+      const shortened = cutJoinedQuestion(sentence);
+      if (shortened !== null) {
+        kept.push(shortened);
+        cut = true;
+        continue;
+      }
     }
     kept.push(sentence);
   }
-  return { text: kept.join(" "), dropped };
+  return { text: kept.join(" "), dropped, cut };
 }
 
 // The model's reply, ready to send: cleaned, trimmed to one question, capped in
 // length, then wrapped in the program prefix and the STOP line.
-// `questionsDropped` says how many extra questions the one-question rule cut.
+// `questionsDropped` says how many extra questions the one-question rule cut;
+// `compoundCut` says the kept question was shortened at an "and" that joined a
+// second question.
 export function formatOutboundWithInfo(
   text: string,
   prefix: string,
-): { body: string; questionsDropped: number } {
+): { body: string; questionsDropped: number; compoundCut: boolean } {
   const cleaned = text
     .replace(/[*`]/g, "")
     .replace(/\s*Reply\s+STOP\b[^.!?\n]*[.!?]?/gi, "")
@@ -92,7 +104,11 @@ export function formatOutboundWithInfo(
     out = cut >= 0 ? out.slice(0, cut + 1) : out.slice(0, MAX_REPLY_CHARS).trimEnd();
   }
 
-  return { body: `${prefix} ${out} ${STOP_SUFFIX}`, questionsDropped: limited.dropped };
+  return {
+    body: `${prefix} ${out} ${STOP_SUFFIX}`,
+    questionsDropped: limited.dropped,
+    compoundCut: limited.cut,
+  };
 }
 
 export function formatOutbound(text: string, prefix: string): string {

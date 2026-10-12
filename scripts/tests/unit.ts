@@ -35,7 +35,7 @@ async function main() {
   }) as typeof fetch;
 
   const { classifyInbound } = await import("../../src/lib/agent/keywords");
-  const { formatOutbound, limitQuestions, stripForHistory } = await import("../../src/lib/agent/format");
+  const { formatOutbound, formatOutboundWithInfo, limitQuestions, stripForHistory } = await import("../../src/lib/agent/format");
   const { isValidEmail, normalizeZip, zipInArea } = await import("../../src/lib/agent/area");
   const { buildSlots, centralToUtc, openSlots } = await import("../../src/lib/agent/clock");
   const { bookingCustomerEmail, escalationOwnerEmail } = await import("../../src/lib/agent/emails");
@@ -137,6 +137,35 @@ async function main() {
   limit("It's 98.6 degrees. Is that right?", "It's 98.6 degrees. Is that right?", 0);
   const two = formatOutbound("Is it on? Is it cooling?", P);
   check('formatOutbound("Is it on? Is it cooling?") === "Fieldworx Demo: Is it on? Reply STOP to opt out."', two === `${P} Is it on? Reply STOP to opt out.`, two);
+
+  section("limitQuestions: compound-question backstop (the kept question is cut at 'and' + a question word)");
+  const compound = (input: string, expectedText: string, expectedCut: boolean, expectedDropped = 0) => {
+    const r = limitQuestions(input);
+    check(
+      `limitQuestions(${JSON.stringify(input)}) -> ${JSON.stringify(expectedText)}, cut=${expectedCut}`,
+      r.text === expectedText && r.cut === expectedCut && r.dropped === expectedDropped,
+      r,
+    );
+  };
+  compound("Quick question first: what is your system doing right now, and is it running at all or completely off?", "Quick question first: what is your system doing right now?", true);
+  compound("Is it running at all, and is anyone vulnerable at home?", "Is it running at all?", true);
+  compound("Is it blowing air and making noise?", "Is it blowing air and making noise?", false);
+  compound("Is it running at all, or is it completely off?", "Is it running at all, or is it completely off?", false);
+  compound("Is anyone at home elderly, very young, or unwell?", "Is anyone at home elderly, very young, or unwell?", false);
+  compound("It is hot, and is getting worse.", "It is hot, and is getting worse.", false);
+  compound("It is hot, and is getting worse. Is it running?", "It is hot, and is getting worse. Is it running?", false);
+  compound("It is hot, and is getting worse. Is it on, and is it cold?", "It is hot, and is getting worse. Is it on?", true);
+  compound("Sorry about that. Is it on and is it cold?", "Sorry about that. Is it on?", true);
+  compound("Is it on, and is it cold? Is anyone home?", "Is it on?", true, 1);
+  compound("IS IT ON, AND IS ANYONE HOME?", "IS IT ON?", true);
+  compound("And is it on?", "And is it on?", false);
+  const info = formatOutboundWithInfo("Is it running at all, and is anyone vulnerable at home?", P);
+  check(
+    "formatOutboundWithInfo: body is cut, compoundCut true, questionsDropped 0",
+    info.body === `${P} Is it running at all? Reply STOP to opt out.` && info.compoundCut === true && info.questionsDropped === 0,
+    info,
+  );
+  check("formatOutboundWithInfo: an ordinary reply has compoundCut false", formatOutboundWithInfo("Is it running at all, or is it completely off?", P).compoundCut === false);
 
   // ------------------------------------------------------------------
   section("area: normalizeZip, zipInArea, isValidEmail");
@@ -276,6 +305,12 @@ async function main() {
       demoPrompt.includes("unless the value is \"failed\""),
   );
   check('prompt says an email on file is not permission ("no_consent")', demoPrompt.includes('"no_consent"') && demoPrompt.includes("An email on file is not permission"));
+  check(
+    "prompt has the one-thing-per-message rule, right after the one-question rule",
+    demoPrompt.includes(
+      `- End with exactly one question, or none. Never use two question marks, and never add a second question with "also" or "and".\n- Ask about one thing per message. Never join two separate questions with 'and'; for example, not 'Is it running at all, and is anyone vulnerable at home?' A single either/or question is fine (for example, 'Is it running at all, or is it completely off?').`,
+    ),
+  );
 
   const inserts: { table: string; row: Record<string, unknown> }[] = [];
   const fakeSupabase = {
@@ -479,6 +514,30 @@ async function main() {
   else process.env.TWILIO_AUTH_TOKEN = savedToken;
 
   eq("send, status and verify tests: fetch never called", fetchCalls, 0);
+
+  // ------------------------------------------------------------------
+  section("eval check: findCompoundQuestions (two questions joined by 'and'; same matcher as the backstop)");
+  const { findCompoundQuestions } = await import("../../src/lib/agent/questions");
+  for (const s of ["Is it running at all, and is anyone vulnerable at home?", "What is the address, and when did it start?"]) {
+    eq(`fails: ${JSON.stringify(s)}`, findCompoundQuestions(s), [s]);
+  }
+  for (const s of [
+    "Is it running at all, or is it completely off?",
+    "Is anyone in the home especially vulnerable to heat, like infants, elderly, or anyone with a medical condition?",
+    "Is anyone at home elderly, very young, or unwell?",
+    "Do you want morning or afternoon?",
+    "Is it blowing air and making noise?",
+  ]) {
+    eq(`passes: ${JSON.stringify(s)}`, findCompoundQuestions(s), []);
+  }
+  eq("'or' is never flagged, even before a question word", findCompoundQuestions("Can you send a photo or do you want to call?"), []);
+  eq("only the offending question sentence is returned, from a longer reply", findCompoundQuestions("Sorry about that. It is hot and is getting worse. Is it running, and is anyone home?"), ["Is it running, and is anyone home?"]);
+  eq("a statement with 'and is' is not a question", findCompoundQuestions("It is hot and is getting worse."), []);
+  eq("case-insensitive", findCompoundQuestions("IS IT ON, AND IS ANYONE HOME?"), ["IS IT ON, AND IS ANYONE HOME?"]);
+  eq("'and how' counts; 'and any' and 'and anyone' do not (they occur in lists)", findCompoundQuestions("Is it old and how old? Is it loud and any smell? Is it on and anyone home?"), ["Is it old and how old?"]);
+  eq("two offending sentences are both returned, in order", findCompoundQuestions("Is it on and is it cold? Can you wait and will you call?"), ["Is it on and is it cold?", "Can you wait and will you call?"]);
+  eq("a word that only starts with a starter does not count ('and issues')", findCompoundQuestions("Any noise and issues with the thermostat?"), []);
+  eq("no reply, no offenders", findCompoundQuestions(""), []);
 
   // ------------------------------------------------------------------
   console.log(`\nTotal: ${passed + failed} cases, ${passed} passed, ${failed} failed`);

@@ -562,10 +562,28 @@ async function main() {
     const t = db.tables;
     same("stored reply is the one-question version", outbound(db)[0]?.body, "Fieldworx Demo: Is it running? Reply STOP to opt out.");
     same("1 outbound reply", outbound(db).length, 1);
-    same("onEvent fired once with dropped 1", events, [{ type: "question_trimmed", dropped: 1 }]);
+    same("onEvent fired once with dropped 1", events, [{ type: "question_trimmed", reason: "extra_question", dropped: 1 }]);
     same("agent_runs outcome replied", t.agent_runs[0].outcome, "replied");
     fact('log line "[agent] trimmed 1 extra question(s)" written', lines.includes("[agent] trimmed 1 extra question(s)"), lines);
     same("no log line carries any message text", lines.filter((l) => l.includes("Is it running") || l.includes("anyone home")), []);
+  });
+
+  await testCase("13b compound question (the backstop cuts at 'and' end to end, with its own reason)", async () => {
+    const { db, args } = world({ profile: { program_prefix: "Fieldworx Demo:" } });
+    const { lines, events } = await run(db, args, [textStep("Thanks for the details. Is it running at all, and is anyone vulnerable at home?")]);
+    same("stored reply is cut at the 'and'", outbound(db)[0]?.body, "Fieldworx Demo: Thanks for the details. Is it running at all? Reply STOP to opt out.");
+    same("onEvent fired once, reason compound_question", events, [{ type: "question_trimmed", reason: "compound_question", dropped: 1 }]);
+    fact('log line "[agent] cut a compound question" written', lines.includes("[agent] cut a compound question"), lines);
+    same("no log line carries any message text", lines.filter((l) => l.includes("running at all") || l.includes("vulnerable")), []);
+    same("agent_runs outcome replied", db.tables.agent_runs[0].outcome, "replied");
+
+    const both = world({ profile: { program_prefix: "Fieldworx Demo:" } });
+    const second = await run(both.db, both.args, [textStep("Is it on, and is it cold? Is anyone home?")]);
+    same("a compound first question plus an extra question: both events, in order", second.events, [
+      { type: "question_trimmed", reason: "extra_question", dropped: 1 },
+      { type: "question_trimmed", reason: "compound_question", dropped: 1 },
+    ]);
+    same("stored reply is the cut first question only", outbound(both.db)[0]?.body, "Fieldworx Demo: Is it on? Reply STOP to opt out.");
   });
 
   // ---- returning customers and email consent ----

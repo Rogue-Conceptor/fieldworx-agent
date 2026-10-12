@@ -57,6 +57,7 @@ export function buildSystemPrompt(
     "- Plain text only. No markdown, no emoji, no links.",
     "- Respond to what the customer actually said before asking anything.",
     `- End with exactly one question, or none. Never use two question marks, and never add a second question with "also" or "and".`,
+    "- Ask about one thing per message. Never join two separate questions with 'and'; for example, not 'Is it running at all, and is anyone vulnerable at home?' A single either/or question is fine (for example, 'Is it running at all, or is it completely off?').",
     "- When more than one thing needs asking, ask only the first one in this order: an email address that looks wrong; confirming on-file details; triage; scheduling.",
     "- Triage before scheduling: before offering times, find out what the equipment is doing and how urgent it is. If the customer asks for a time first, acknowledge it in a few words, then ask what the system is doing.",
     `- Don't re-ask anything the customer already told you.`,
