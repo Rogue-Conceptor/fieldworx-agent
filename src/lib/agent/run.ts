@@ -28,6 +28,7 @@ import {
   type OptStatus,
 } from "./optstatus";
 import { buildSystemPrompt, type AgentProfile } from "./prompt";
+import { checkRateLimit } from "./ratelimit";
 import { sendOutbound } from "./send";
 import { executeTool, TOOL_DEFINITIONS, type ToolContext } from "./tools";
 
@@ -36,6 +37,7 @@ type Outcome =
   | "fallback"
   | "skipped_keyword"
   | "skipped_opted_out"
+  | "rate_limited"
   | "safety"
   | "superseded"
   | "send_failed"
@@ -285,6 +287,20 @@ export async function processInbound(
         error_code: optCheckFailed ? "opt_check_failed" : null,
       });
       logRun("skipped_opted_out", a.conversationId, total);
+      return;
+    }
+
+    // 2a'. over a rate limit: no opt-in text, no model, no tools, no reply. If
+    // the check itself fails, the run goes ahead (only the opt-out check fails
+    // closed).
+    const rate = await checkRateLimit(supabase, a.businessId, a.customerNumber);
+    if (rate.checkFailed) console.error("[agent] rate limit check failed");
+    if (rate.limited) {
+      const total = await recordRun(supabase, a, {
+        outcome: "rate_limited",
+        error_code: rate.limited,
+      });
+      logRun("rate_limited", a.conversationId, total);
       return;
     }
 

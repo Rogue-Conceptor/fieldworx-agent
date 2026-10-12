@@ -9,7 +9,7 @@ import {
   escalationOwnerEmail,
   kindLabel,
 } from "./emails";
-import { sendEmail, type EmailStatus } from "./notify";
+import { EMAIL_CAP_CODES, sendEmail, type EmailStatus } from "./notify";
 import { loadOnFile } from "./onfile";
 import type { AgentProfile } from "./prompt";
 
@@ -211,20 +211,27 @@ export type ConfirmationEmail =
   | "already_sent"
   | "no_bookings"
   | "failed"
+  | "not_sent_limit"
   | "not_requested";
+
+// One confirmation attempt: what sendEmail recorded, or "capped" when a cap
+// held it back (the notification row says "logged" but nothing was sent).
+type ConfirmationSend = EmailStatus | "capped";
 
 type ConfirmationRun = {
   appointments: number; // scheduled appointments on this lead
-  results: EmailStatus[]; // one per confirmation this call attempted
+  results: ConfirmationSend[]; // one per confirmation this call attempted
   lookupFailed: boolean;
 };
 
 // What the model is told about the confirmation email after a save. A lookup
-// error counts as "failed": the confirmation could not be sent.
+// error counts as "failed": the confirmation could not be sent. With several
+// results the worst one wins: failed, then not_sent_limit (a cap held a
+// confirmation back), then logged, then sent.
 export function confirmationOutcome(args: {
   requested: boolean;
   appointments: number;
-  results: EmailStatus[];
+  results: ConfirmationSend[];
   lookupFailed: boolean;
 }): ConfirmationEmail {
   if (!args.requested) return "not_requested";
@@ -232,13 +239,15 @@ export function confirmationOutcome(args: {
   if (args.appointments === 0) return "no_bookings";
   if (args.results.length === 0) return "already_sent";
   if (args.results.includes("failed")) return "failed";
-  return args.results.includes("sent") ? "sent" : "logged";
+  if (args.results.includes("capped")) return "not_sent_limit";
+  return args.results.includes("logged") ? "logged" : "sent";
 }
 
 // An email that arrives after the booking still gets its confirmation: every
 // scheduled appointment on this lead that has no sent or logged customer
 // notification to this same address is confirmed to it. A failed earlier send,
-// or one to a different address, does not count, so it is tried again. Lookup
+// one to a different address, or one a cap held back (its row is "logged" but
+// carries a cap error_code) does not count, so it is tried again. Lookup
 // errors mean none are sent; they never fail the save.
 async function sendMissingConfirmations(
   ctx: ToolContext,
@@ -263,7 +272,7 @@ async function sendMissingConfirmations(
 
   const { data: existing, error: notificationError } = await supabase
     .from("notifications")
-    .select("appointment_id, recipient")
+    .select("appointment_id, recipient, error_code")
     .eq("business_id", businessId)
     .eq("audience", "customer")
     .in("status", ["sent", "logged"])
@@ -276,13 +285,15 @@ async function sendMissingConfirmations(
     return { appointments: appointments.length, results: [], lookupFailed: true };
   }
   const wanted = to.toLowerCase();
+  const capCodes: readonly string[] = EMAIL_CAP_CODES;
   const confirmed = new Set(
     (existing ?? [])
       .filter((n) => String(n.recipient ?? "").toLowerCase() === wanted)
+      .filter((n) => !capCodes.includes(String(n.error_code ?? "")))
       .map((n) => n.appointment_id as string),
   );
 
-  const results: EmailStatus[] = [];
+  const results: ConfirmationSend[] = [];
   for (const appointment of appointments) {
     if (confirmed.has(appointment.id as string)) continue;
     const kind = appointment.kind as SlotKind;
@@ -303,7 +314,7 @@ async function sendMissingConfirmations(
       template: "booking_customer",
       ...mail,
     });
-    results.push(result.status);
+    results.push(result.capped ? "capped" : result.status);
   }
   return { appointments: appointments.length, results, lookupFailed: false };
 }
@@ -493,7 +504,9 @@ async function saveCustomerDetails(
         requested: emailText !== "",
         ...confirmation,
       }),
-      confirmations_sent: confirmation.results.filter((status) => status !== "failed").length,
+      confirmations_sent: confirmation.results.filter(
+        (status) => status !== "failed" && status !== "capped",
+      ).length,
     },
     true,
   );
@@ -660,7 +673,7 @@ async function bookAppointment(
   const customerTo: string | null = consentError
     ? null
     : ((consentRow?.email_consent_address as string | null | undefined) ?? null);
-  const customerSend: Promise<EmailStatus | "no_consent"> = customerTo
+  const customerSend: Promise<EmailStatus | "no_consent" | "not_sent_limit"> = customerTo
     ? (() => {
         const mail = bookingCustomerEmail({
           kindLabel: label,
@@ -675,7 +688,7 @@ async function bookAppointment(
           to: customerTo,
           template: "booking_customer",
           ...mail,
-        }).then((r) => r.status);
+        }).then((r) => (r.capped ? "not_sent_limit" : r.status));
       })()
     : Promise.resolve("no_consent");
 

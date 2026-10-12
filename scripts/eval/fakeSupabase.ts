@@ -230,6 +230,8 @@ class Query {
   private columns: string[] | null = null;
   private payload: any;
   private conflictColumns: string[] = ["id"];
+  private wantCount = false;
+  private headOnly = false;
   private filters: Predicate[] = [];
   private ordering: { column: string; ascending: boolean }[] = [];
   private rowLimit: number | null = null;
@@ -240,11 +242,15 @@ class Query {
     private table: string,
   ) {}
 
-  select(columns?: string, _options?: unknown): this {
+  // `{ count: "exact" }` adds the number of matching rows (before any limit) to
+  // the result; `head: true` then returns the count and no rows.
+  select(columns?: string, options?: { count?: "exact"; head?: boolean }): this {
     const parsed =
       columns && columns.trim() !== "*" ? columns.split(",").map((c) => c.trim()) : null;
     if (this.op !== "select") this.returning = true; // select after insert/update/delete
     this.columns = parsed;
+    if (options?.count) this.wantCount = true;
+    if (options?.head) this.headOnly = true;
     return this;
   }
   insert(payload: any): this {
@@ -325,7 +331,7 @@ class Query {
     return Object.fromEntries(this.columns.map((c) => [c, copy[c]]));
   }
 
-  private execute(): { data: any; error: DbError | null } {
+  private execute(): { data: any; error: DbError | null; count?: number | null } {
     const { db, table } = this;
     const rows = db.tables[table];
 
@@ -341,8 +347,13 @@ class Query {
           return ascending ? cmp : -cmp;
         });
       }
+      const total = found.length;
       if (this.rowLimit !== null) found = found.slice(0, this.rowLimit);
-      return { data: found.map((r) => this.project(r)), error: null };
+      return {
+        data: this.headOnly ? null : found.map((r) => this.project(r)),
+        error: null,
+        ...(this.wantCount ? { count: total } : {}),
+      };
     }
 
     // A failure queued with failNext() hits the next matching write.
@@ -443,8 +454,8 @@ class Query {
     return { data: data[0], error: null };
   }
 
-  then<T1 = { data: any; error: DbError | null }, T2 = never>(
-    onfulfilled?: ((value: { data: any; error: DbError | null }) => T1 | PromiseLike<T1>) | null,
+  then<T1 = { data: any; error: DbError | null; count?: number | null }, T2 = never>(
+    onfulfilled?: ((value: { data: any; error: DbError | null; count?: number | null }) => T1 | PromiseLike<T1>) | null,
     onrejected?: ((reason: any) => T2 | PromiseLike<T2>) | null,
   ): Promise<T1 | T2> {
     return Promise.resolve(this.execute()).then(onfulfilled, onrejected);

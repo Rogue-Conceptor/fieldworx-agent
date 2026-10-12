@@ -1,12 +1,27 @@
 import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { EMAIL_FROM, EMAIL_MODE } from "./config";
+import {
+  CUSTOMER_EMAIL_PER_BUSINESS_DAY,
+  CUSTOMER_EMAIL_PER_NUMBER_DAY,
+  EMAIL_FROM,
+  EMAIL_MODE,
+} from "./config";
 
 export type EmailStatus = "logged" | "sent" | "failed";
+
+// error_code values on a customer email that was held back by a cap (or by a
+// cap check that could not run). The row is "logged", but the email was not
+// sent, so it must never count as a confirmation that went out.
+export const EMAIL_CAP_CODES = [
+  "email_cap_number",
+  "email_cap_business",
+  "email_cap_check_failed",
+] as const;
 
 const RESEND_URL = "https://api.resend.com/emails";
 const RESEND_TIMEOUT_MS = 10000;
 const ERROR_CODE_MAX = 120;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 type Outcome = {
   status: EmailStatus;
@@ -84,8 +99,70 @@ async function deliver(args: {
   }
 }
 
+// Customer emails that were really sent in the last 24 hours, per number and
+// per business. Returns "email_cap_number" or "email_cap_business" when a cap
+// is reached, null when under both. Fails CLOSED: when the answer cannot be
+// found, "email_cap_check_failed", because the harm here is mailing a stranger.
+async function customerEmailCapCode(
+  supabase: SupabaseClient,
+  businessId: string,
+  conversationId: string | null,
+): Promise<string | null> {
+  const failed = "email_cap_check_failed";
+  try {
+    if (!conversationId) return failed;
+    const dayAgo = new Date(Date.now() - DAY_MS).toISOString();
+
+    // The number: every conversation this business has had with it.
+    const { data: conversation, error: conversationError } = await supabase
+      .from("conversations")
+      .select("customer_number")
+      .eq("id", conversationId)
+      .eq("business_id", businessId)
+      .maybeSingle();
+    if (conversationError || !conversation?.customer_number) return failed;
+    const { data: sameNumber, error: sameNumberError } = await supabase
+      .from("conversations")
+      .select("id")
+      .eq("business_id", businessId)
+      .eq("customer_number", conversation.customer_number);
+    if (sameNumberError || !sameNumber || sameNumber.length === 0) return failed;
+
+    const { count: numberCount, error: numberError } = await supabase
+      .from("notifications")
+      .select("id", { count: "exact", head: true })
+      .eq("business_id", businessId)
+      .eq("audience", "customer")
+      .eq("status", "sent")
+      .gte("created_at", dayAgo)
+      .in(
+        "conversation_id",
+        sameNumber.map((c) => c.id as string),
+      );
+    if (numberError || numberCount === null || numberCount === undefined) return failed;
+    if (numberCount >= CUSTOMER_EMAIL_PER_NUMBER_DAY) return "email_cap_number";
+
+    const { count: businessCount, error: businessError } = await supabase
+      .from("notifications")
+      .select("id", { count: "exact", head: true })
+      .eq("business_id", businessId)
+      .eq("audience", "customer")
+      .eq("status", "sent")
+      .gte("created_at", dayAgo);
+    if (businessError || businessCount === null || businessCount === undefined) return failed;
+    if (businessCount >= CUSTOMER_EMAIL_PER_BUSINESS_DAY) return "email_cap_business";
+    return null;
+  } catch {
+    return failed;
+  }
+}
+
 // Sends (or, in log mode, only records) one email and writes a notifications
-// row for it. Never throws, and never logs addresses or bodies.
+// row for it. Never throws, and never logs addresses or bodies. In send mode a
+// customer email over a cap, or whose cap cannot be checked, is not sent: it is
+// recorded as "logged" with the reason in error_code, and `capped` is true so
+// the caller can tell it from an ordinary log-mode "logged". The owner email
+// has no cap, and log mode does no counting.
 export async function sendEmail(
   supabase: SupabaseClient,
   args: {
@@ -99,10 +176,21 @@ export async function sendEmail(
     subject: string;
     text: string;
   },
-): Promise<{ status: EmailStatus }> {
+): Promise<{ status: EmailStatus; capped: boolean }> {
   let outcome: Outcome;
+  let capped = false;
   try {
-    outcome = await deliver({ to: args.to, subject: args.subject, text: args.text });
+    const capCode =
+      args.audience === "customer" && EMAIL_MODE === "send"
+        ? await customerEmailCapCode(supabase, args.businessId, args.conversationId)
+        : null;
+    if (capCode) {
+      capped = true;
+      console.warn(`[notify] customer email held back: ${capCode}`);
+      outcome = { status: "logged", providerMessageId: null, errorCode: capCode };
+    } else {
+      outcome = await deliver({ to: args.to, subject: args.subject, text: args.text });
+    }
   } catch {
     outcome = { status: "failed", providerMessageId: null, errorCode: "unexpected" };
   }
@@ -126,5 +214,5 @@ export async function sendEmail(
     console.error("[notify] record failed");
   }
 
-  return { status: outcome.status };
+  return { status: outcome.status, capped };
 }

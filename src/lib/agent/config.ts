@@ -26,6 +26,15 @@ export const EMAIL_FROM = "Fieldworx Demo <bookings@notify.jerrster.com>";
 
 export const MAX_TOOL_ROUNDS = 5;
 
+// Abuse guards. A text over any rate limit gets no reply at all (outcome
+// rate_limited). Only runs where the agent actually ran count (see
+// ratelimit.ts). The email caps count customer emails that were really sent.
+export const RATE_PER_NUMBER_HOUR = 10;
+export const RATE_PER_NUMBER_DAY = 25;
+export const RATE_PER_BUSINESS_DAY = 100;
+export const CUSTOMER_EMAIL_PER_NUMBER_DAY = 3;
+export const CUSTOMER_EMAIL_PER_BUSINESS_DAY = 20;
+
 // Wall-clock budget for one run, measured from when the webhook received the
 // message. Past it, no new model call or tool execution starts.
 export const RUN_DEADLINE_MS = 45000;

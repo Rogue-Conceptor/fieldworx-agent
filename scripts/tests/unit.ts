@@ -38,7 +38,7 @@ async function main() {
   const { formatOutbound, formatOutboundWithInfo, limitQuestions, stripForHistory } = await import("../../src/lib/agent/format");
   const { isValidEmail, normalizeZip, zipInArea } = await import("../../src/lib/agent/area");
   const { buildSlots, centralToUtc, openSlots } = await import("../../src/lib/agent/clock");
-  const { bookingCustomerEmail, escalationOwnerEmail } = await import("../../src/lib/agent/emails");
+  const { bookingCustomerEmail, bookingOwnerEmail, CUSTOMER_EMAIL_FOOTER, escalationOwnerEmail } = await import("../../src/lib/agent/emails");
   const { confirmationOutcome, executeTool, TOOL_DEFINITIONS } = await import("../../src/lib/agent/tools");
   const { formatOnFile } = await import("../../src/lib/agent/onfile");
   const { buildSystemPrompt } = await import("../../src/lib/agent/prompt");
@@ -213,6 +213,17 @@ async function main() {
   const esc = escalationOwnerEmail({ urgency: "emergency", reason: "r", summary: "s", customerPhone: "+15555550100", businessName: "Dev Test Shop" });
   check('escalationOwnerEmail subject starts with "[EMERGENCY]"', esc.subject.startsWith("[EMERGENCY]"), esc.subject);
 
+  section("emails: the customer footer");
+  eq("footer text", CUSTOMER_EMAIL_FOOTER, "You received this because someone booked a Fieldworx demo by text and gave this address. If that wasn't you, ignore this email.");
+  for (const isDemo of [true, false]) {
+    const text = bookingCustomerEmail({ ...base, isDemo }).text;
+    eq(`customer email (isDemo ${isDemo}): the footer is the last line`, text.split("\n").at(-1), CUSTOMER_EMAIL_FOOTER);
+    eq(`customer email (isDemo ${isDemo}): the footer appears once`, text.split(CUSTOMER_EMAIL_FOOTER).length - 1, 1);
+  }
+  const ownerBooking = bookingOwnerEmail({ kindLabel: "service visit", slotLabel: "Mon Oct 5, 9-11 AM", customerName: "Sam", customerPhone: "+15555550100", address: null, email: null, issue: "AC", businessName: "Dev Test Shop" });
+  check("owner booking email: no footer", !ownerBooking.text.includes("You received this because"), ownerBooking.text);
+  check("owner escalation email: no footer", !esc.text.includes("You received this because"), esc.text);
+
   // ------------------------------------------------------------------
   section("tools, onfile, prompt, notify");
   eq("TOOL_DEFINITIONS names", TOOL_DEFINITIONS.map((t) => t.name), [
@@ -279,7 +290,7 @@ async function main() {
   );
 
   // confirmation_email, in the order confirmationOutcome decides it.
-  const outcome = (requested: boolean, appointments: number, results: ("logged" | "sent" | "failed")[], lookupFailed = false) =>
+  const outcome = (requested: boolean, appointments: number, results: ("logged" | "sent" | "failed" | "capped")[], lookupFailed = false) =>
     confirmationOutcome({ requested, appointments, results, lookupFailed });
   eq("confirmationOutcome: no email in the call -> not_requested", outcome(false, 2, ["sent"]), "not_requested");
   eq("confirmationOutcome: lookup error -> failed", outcome(true, 1, [], true), "failed");
@@ -288,9 +299,21 @@ async function main() {
   eq("confirmationOutcome: all already confirmed -> already_sent", outcome(true, 2, []), "already_sent");
   eq("confirmationOutcome: one logged -> logged", outcome(true, 1, ["logged"]), "logged");
   eq("confirmationOutcome: one sent -> sent", outcome(true, 1, ["sent"]), "sent");
-  eq("confirmationOutcome: sent and logged -> sent", outcome(true, 2, ["logged", "sent"]), "sent");
+  // Precedence, worst first: failed > not_sent_limit > logged > sent. (Before the
+  // email caps, sent and logged -> sent; the two cannot mix in practice, since
+  // the email mode is global.)
+  eq("confirmationOutcome: sent and logged -> logged (logged ranks above sent)", outcome(true, 2, ["logged", "sent"]), "logged");
   eq("confirmationOutcome: delivery failed -> failed", outcome(true, 1, ["failed"]), "failed");
   eq("confirmationOutcome: one sent, one failed -> failed (the failed one is retried next save)", outcome(true, 2, ["sent", "failed"]), "failed");
+  eq("confirmationOutcome: every send capped -> not_sent_limit", outcome(true, 1, ["capped"]), "not_sent_limit");
+  eq("confirmationOutcome: two sends, both capped -> not_sent_limit", outcome(true, 2, ["capped", "capped"]), "not_sent_limit");
+  eq("confirmationOutcome: capped and failed -> failed (failed ranks above not_sent_limit)", outcome(true, 2, ["capped", "failed"]), "failed");
+  eq("confirmationOutcome: capped and sent -> not_sent_limit", outcome(true, 2, ["sent", "capped"]), "not_sent_limit");
+  eq("confirmationOutcome: capped and logged -> not_sent_limit (above logged)", outcome(true, 2, ["logged", "capped"]), "not_sent_limit");
+  eq("confirmationOutcome: capped and sent and failed -> failed", outcome(true, 3, ["sent", "capped", "failed"]), "failed");
+  eq("confirmationOutcome: not requested -> not_requested even if capped", outcome(false, 1, ["capped"]), "not_requested");
+  eq("confirmationOutcome: no scheduled appointments -> no_bookings even with capped results", outcome(true, 0, ["capped"]), "no_bookings");
+  eq("confirmationOutcome: lookup error -> failed even with capped results", outcome(true, 1, ["capped"], true), "failed");
 
   const demoPrompt = buildSystemPrompt({ display_name: "Dev Test Shop", is_demo: true }, "- Nothing on file yet.", now);
   const realPrompt = buildSystemPrompt({ display_name: "Real Shop", is_demo: false }, "- Nothing on file yet.", now);
@@ -301,8 +324,17 @@ async function main() {
   check('prompt tells the agent what to do with a "not yet confirmed" name', demoPrompt.includes('marked "not yet confirmed"') && demoPrompt.includes("Am I speaking with"), demoPrompt);
   check(
     "prompt covers every confirmation_email value",
-    ["sent", "logged", "already_sent", "no_bookings", "not_requested", "failed"].every((value) => demoPrompt.includes(`"${value}"`)) &&
+    ["sent", "logged", "already_sent", "no_bookings", "not_requested", "failed", "not_sent_limit"].every((value) => demoPrompt.includes(`"${value}"`)) &&
       demoPrompt.includes("unless the value is \"failed\""),
+  );
+  check(
+    'prompt: confirmation_email "not_sent_limit" -> the email can\'t be sent right now, the booking is still confirmed, do not offer to try again',
+    demoPrompt.includes(`"not_sent_limit": say the confirmation email can't be sent right now and the booking itself is still confirmed; do not offer to try again.`) &&
+      demoPrompt.includes(`unless the value is "failed" or "not_sent_limit"`),
+  );
+  check(
+    'prompt: emails.customer "not_sent_limit" after booking -> do not offer an email confirmation',
+    demoPrompt.includes(`If emails.customer is "not_sent_limit", don't offer an email confirmation and don't say one is on its way.`),
   );
   check('prompt says an email on file is not permission ("no_consent")', demoPrompt.includes('"no_consent"') && demoPrompt.includes("An email on file is not permission"));
   check(
@@ -338,6 +370,20 @@ async function main() {
   eq("sendEmail log mode: exactly one insert", inserts.length, 1);
   check('sendEmail log mode: insert is a notifications row with status "logged"', inserts[0]?.table === "notifications" && inserts[0]?.row.status === "logged", inserts[0]);
   eq("sendEmail log mode: fetch never called", fetchCalls, 0);
+  // Log mode does no cap counting: this fake has no select(), so a count would
+  // fail and the row would say email_cap_check_failed.
+  const customerLogged = await sendEmail(fakeSupabase as never, {
+    businessId: "b",
+    conversationId: "c",
+    leadId: "l",
+    appointmentId: null,
+    audience: "customer",
+    to: "pat@example.com",
+    template: "booking_customer",
+    subject: "s",
+    text: "t",
+  });
+  eq("sendEmail log mode, customer: status logged, one more insert, no error_code (no cap counting)", [customerLogged.status, inserts.length, inserts[1]?.row.error_code], ["logged", 2, null]);
 
   // ------------------------------------------------------------------
   section("send: delivery-status callback URL from PUBLIC_BASE_URL");

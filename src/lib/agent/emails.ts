@@ -39,6 +39,11 @@ export function bookingOwnerEmail(args: {
   };
 }
 
+// Last line of every customer email: it can reach an address typed by someone
+// else, so it says why it arrived and what to do.
+export const CUSTOMER_EMAIL_FOOTER =
+  "You received this because someone booked a Fieldworx demo by text and gave this address. If that wasn't you, ignore this email.";
+
 export function bookingCustomerEmail(args: {
   kindLabel: string;
   slotLabel: string;
@@ -57,7 +62,7 @@ export function bookingCustomerEmail(args: {
       "This is a demo booking made by an AI assistant built by Jerry King. No technician will be sent and no appointment is real.",
     );
   }
-  lines.push("", `- ${args.businessName}`);
+  lines.push("", `- ${args.businessName}`, "", CUSTOMER_EMAIL_FOOTER);
   return {
     subject: `${args.businessName}: your ${args.kindLabel} for ${args.slotLabel}`,
     text: lines.join("\n"),

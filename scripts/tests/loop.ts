@@ -962,6 +962,177 @@ async function main() {
     same("no log line contains the phone number", leakedFrom(lines, [PHONE]), []);
   });
 
+  // ---- rate limits (abuse guards) ----
+
+  const HOUR = 3_600_000;
+  const DAY = 24 * HOUR;
+  let seededRuns = 0;
+  // `count` agent_runs rows, each `ageOf(i)` ms old, for a conversation (default:
+  // this number's).
+  function seedRuns(
+    db: FakeSupabase,
+    count: number,
+    ageOf: (i: number) => number,
+    options: { conversation?: string; outcome?: string; business?: string } = {},
+  ) {
+    for (let i = 0; i < count; i++) {
+      seed(db, "agent_runs", {
+        business_id: options.business ?? BIZ,
+        conversation_id: options.conversation ?? CONV,
+        inbound_message_id: `seeded-${++seededRuns}`,
+        outcome: options.outcome ?? "replied",
+        created_at: new Date(Date.now() - ageOf(i)).toISOString(),
+      });
+    }
+  }
+  // Another number with its own conversation and one inbound message, same business.
+  function otherNumber(db: FakeSupabase, n: number) {
+    const phone = `+155555502${String(n).padStart(2, "0")}`;
+    const conv = `conv-o${n}`;
+    seed(db, "conversations", { id: conv, business_id: BIZ, lead_id: LEAD, channel: "sms", customer_number: phone, business_number: BUSINESS_NUMBER, status: "active", email_consent_address: null, email_consent_at: null });
+    seed(db, "messages", { id: `inb-o${n}`, business_id: BIZ, conversation_id: conv, direction: "inbound", body: NORMAL_TEXT });
+    return { conv, phone, inbound: `inb-o${n}` };
+  }
+  // `total` counted runs spread over other numbers (5 each), all within the last day.
+  function seedBusinessRuns(db: FakeSupabase, total: number) {
+    for (let n = 1, left = total; left > 0; n++, left -= 5) {
+      const { conv } = otherNumber(db, n);
+      seedRuns(db, Math.min(5, left), (j) => (1 + j) * HOUR + n * 60_000, { conversation: conv });
+    }
+  }
+  const lastRun = (db: FakeSupabase) => db.tables.agent_runs.at(-1)!;
+  const hourAges = (i: number) => (i + 1) * 5 * 60_000; // 5, 10, 15, ... minutes ago
+
+  await testCase("37  9 counted runs in the last hour -> the text runs; 10 -> rate_limited per_number_hour (nothing sent)", async () => {
+    const nine = world();
+    seedRuns(nine.db, 9, hourAges);
+    const ran = await run(nine.db, nine.args, [textStep(MODEL_REPLY)]);
+    same("9 counted: the model is called and the run replied", [ran.model.calls.length, lastRun(nine.db).outcome], [1, "replied"]);
+
+    const ten = world();
+    const sender = fakeSender();
+    seedRuns(ten.db, 10, hourAges);
+    const limited = await run(ten.db, say(ten.args, NORMAL_TEXT, { conversationIsNew: true }), [textStep(NEVER)], sender.send);
+    same("10 counted: rate_limited, error_code per_number_hour, no keyword", [lastRun(ten.db).outcome, lastRun(ten.db).error_code, lastRun(ten.db).keyword ?? null], ["rate_limited", "per_number_hour", null]);
+    same("no model call, no text sent (not even the opt-in text), nothing stored", [limited.model.calls.length, sender.calls.length, outbound(ten.db).length], [0, 0, 0]);
+    same("the only write is the run row (no tool, lead or customer writes)", writesAfter(ten.db), ["agent_runs:insert"]);
+    same("no tool calls recorded", lastRun(ten.db).tool_calls, []);
+    same("no log line contains the phone number", leakedFrom(limited.lines, [PHONE]), []);
+
+    const gas = world();
+    seedRuns(gas.db, 10, hourAges);
+    const gasRun = await run(gas.db, say(gas.args, "I smell gas in the kitchen"), [textStep(NEVER)]);
+    same("a safety text over the limit is rate limited too", [lastRun(gas.db).outcome, gasRun.model.calls.length, outbound(gas.db).length], ["rate_limited", 0, 0]);
+  });
+
+  await testCase("38  24 counted runs in 24 h (none in the last hour) -> the text runs; 25 -> rate_limited per_number_day", async () => {
+    const spread = (i: number) => (2 + i * 0.5) * HOUR; // 2 h .. 14 h ago
+    const twentyFour = world();
+    seedRuns(twentyFour.db, 24, spread);
+    const ran = await run(twentyFour.db, twentyFour.args, [textStep(MODEL_REPLY)]);
+    same("24 counted: the run replied", [ran.model.calls.length, lastRun(twentyFour.db).outcome], [1, "replied"]);
+
+    const twentyFive = world();
+    const sender = fakeSender();
+    seedRuns(twentyFive.db, 25, spread);
+    const limited = await run(twentyFive.db, say(twentyFive.args, NORMAL_TEXT, { conversationIsNew: true }), [textStep(NEVER)], sender.send);
+    same("25 counted: rate_limited, error_code per_number_day", [lastRun(twentyFive.db).outcome, lastRun(twentyFive.db).error_code], ["rate_limited", "per_number_day"]);
+    same("no model call, no text sent", [limited.model.calls.length, sender.calls.length], [0, 0]);
+  });
+
+  await testCase("39  99 counted runs business-wide in 24 h -> the text runs; 100 -> rate_limited per_business_day", async () => {
+    const ninetyNine = world();
+    seedBusinessRuns(ninetyNine.db, 99);
+    const ran = await run(ninetyNine.db, ninetyNine.args, [textStep(MODEL_REPLY)]);
+    same("99 counted: the run replied", [ran.model.calls.length, lastRun(ninetyNine.db).outcome], [1, "replied"]);
+
+    const hundred = world();
+    const sender = fakeSender();
+    seedBusinessRuns(hundred.db, 100);
+    same("this number has no runs of its own", hundred.db.tables.agent_runs.filter((r) => r.conversation_id === CONV).length, 0);
+    const limited = await run(hundred.db, say(hundred.args, NORMAL_TEXT, { conversationIsNew: true }), [textStep(NEVER)], sender.send);
+    same("100 counted: rate_limited, error_code per_business_day", [lastRun(hundred.db).outcome, lastRun(hundred.db).error_code], ["rate_limited", "per_business_day"]);
+    same("no model call, no text sent", [limited.model.calls.length, sender.calls.length], [0, 0]);
+
+    const elsewhere = world();
+    seedRuns(elsewhere.db, 100, (i) => (1 + (i % 20)) * HOUR, { business: "biz-other", conversation: "conv-elsewhere" });
+    const free = await run(elsewhere.db, elsewhere.args, [textStep(MODEL_REPLY)]);
+    same("100 runs of a different business do not count", [free.model.calls.length, lastRun(elsewhere.db).outcome], [1, "replied"]);
+  });
+
+  await testCase("40  skipped_keyword, skipped_opted_out and rate_limited runs do not count", async () => {
+    const { db, args } = world();
+    seedRuns(db, 9, hourAges);
+    seedRuns(db, 10, hourAges, { outcome: "skipped_keyword" });
+    seedRuns(db, 10, hourAges, { outcome: "skipped_opted_out" });
+    seedRuns(db, 10, hourAges, { outcome: "rate_limited" });
+    const other = otherNumber(db, 1);
+    seedRuns(db, 100, (i) => (1 + (i % 20)) * HOUR, { conversation: other.conv, outcome: "rate_limited" });
+    seedRuns(db, 100, (i) => (1 + (i % 20)) * HOUR, { conversation: other.conv, outcome: "skipped_keyword" });
+    const ran = await run(db, args, [textStep(MODEL_REPLY)]);
+    same("9 counted among 30 uncounted (and 200 uncounted business-wide): the run replied", [ran.model.calls.length, lastRun(db).outcome], [1, "replied"]);
+  });
+
+  await testCase("41  runs older than the window do not count", async () => {
+    // Just outside the hour (61 min and older): 10 of them leave the hour count at 0.
+    const hour = world();
+    seedRuns(hour.db, 10, (i) => 61 * 60_000 + i * 60_000);
+    same("10 runs 61+ minutes old: the run replied", [(await run(hour.db, hour.args, [textStep(MODEL_REPLY)])).model.calls.length, lastRun(hour.db).outcome], [1, "replied"]);
+    // Just outside the day: 25 runs older than 24 h.
+    const day = world();
+    seedRuns(day.db, 25, (i) => DAY + 60_000 + i * 60_000);
+    same("25 runs older than 24 h: the run replied", [(await run(day.db, day.args, [textStep(MODEL_REPLY)])).model.calls.length, lastRun(day.db).outcome], [1, "replied"]);
+    // Business: 100 runs older than 24 h.
+    const business = world();
+    const other = otherNumber(business.db, 1);
+    seedRuns(business.db, 100, (i) => DAY + 60_000 + i * 60_000, { conversation: other.conv });
+    same("100 business runs older than 24 h: the run replied", [(await run(business.db, business.args, [textStep(MODEL_REPLY)])).model.calls.length, lastRun(business.db).outcome], [1, "replied"]);
+    // Control: the same 10 runs just inside the hour do block.
+    const inside = world();
+    seedRuns(inside.db, 10, (i) => 50 * 60_000 + i * 10_000);
+    await run(inside.db, inside.args, [textStep(NEVER)]);
+    same("control: 10 runs 50 minutes old: rate_limited per_hour", [lastRun(inside.db).outcome, lastRun(inside.db).error_code], ["rate_limited", "per_number_hour"]);
+  });
+
+  await testCase("42  a count query error -> the run goes ahead, with one fixed log line", async () => {
+    const fail = async (label: string, arrange: (db: FakeSupabase) => void, expectedOutcome: string) => {
+      const { db, args } = world();
+      seedRuns(db, 10, hourAges);
+      arrange(db);
+      const { model, lines } = await run(db, args, [textStep(MODEL_REPLY)]);
+      same(`${label}: outcome`, lastRun(db).outcome, expectedOutcome);
+      same(`${label}: the model was ${expectedOutcome === "replied" ? "called" : "not called"}`, model.calls.length, expectedOutcome === "replied" ? 1 : 0);
+      fact(`${label}: fixed log line written`, lines.includes("[agent] rate limit check failed"), lines);
+      same(`${label}: no log line contains the phone number or the DB error text`, leakedFrom(lines, [PHONE, "boom"]), []);
+    };
+    const boom = { message: "boom", code: "XX000" };
+    await fail("conversations lookup fails (10 in the hour would block)", (db) => db.failNext("conversations", "select", boom), "replied");
+    await fail("number runs query fails and business count fails", (db) => { db.failNext("agent_runs", "select", boom); db.failNext("agent_runs", "select", boom); }, "replied");
+    await fail("number check fails but the business is over its limit: still limited", (db) => { db.failNext("conversations", "select", boom); seedBusinessRuns(db, 100); }, "rate_limited");
+  });
+
+  await testCase("43  STOP while over the limit is still recorded (keywords first); opt-out beats the limit", async () => {
+    const { db, args } = world();
+    seedRuns(db, 10, hourAges);
+    const sender = fakeSender();
+    const stop = await run(db, say(args, "STOP"), [], sender.send);
+    same("opt row: opted_out, keyword STOP, source keyword", optColumns(db), [[BIZ, PHONE, "opted_out", "STOP", "keyword"]]);
+    same("run: skipped_keyword with the keyword (not rate_limited)", [lastRun(db).outcome, lastRun(db).keyword], ["skipped_keyword", "STOP"]);
+    same("no model call, no text sent", [stop.model.calls.length, sender.calls.length], [0, 0]);
+    await run(db, say(args, NORMAL_TEXT, { inboundMessageId: "inb-3" }), [textStep(NEVER)], sender.send);
+    same("a normal text after: skipped_opted_out (the opt-out check comes before the limit), no error_code", [lastRun(db).outcome, lastRun(db).error_code], ["skipped_opted_out", null]);
+  });
+
+  await testCase("44  another number is not limited by this number's runs", async () => {
+    const { db, args } = world();
+    seedRuns(db, 10, hourAges);
+    const other = otherNumber(db, 1);
+    const ran = await run(db, { ...args, customerNumber: other.phone, conversationId: other.conv, inboundMessageId: other.inbound }, [textStep(MODEL_REPLY)]);
+    same("the other number's text runs: the model is called and the run replied", [ran.model.calls.length, lastRun(db).outcome], [1, "replied"]);
+    await run(db, args, [textStep(NEVER)]);
+    same("control: this number, with the same 10 runs, is limited", [lastRun(db).outcome, lastRun(db).error_code], ["rate_limited", "per_number_hour"]);
+  });
+
   // ---------------------------------------------------------------------------
   console.log("");
   const networkOk = fetchCalls === 0;
