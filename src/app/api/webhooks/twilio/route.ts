@@ -1,8 +1,8 @@
 import { NextRequest } from "next/server";
 import { waitUntil } from "@vercel/functions";
-import { validateRequest } from "twilio";
 import { processInbound } from "@/lib/agent/run";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { verifyTwilioRequest } from "@/lib/twilio/verify";
 
 // twilio's signature validation uses Node's crypto, so this must run on the
 // Node.js runtime (not Edge).
@@ -16,18 +16,6 @@ function twimlResponse() {
     status: 200,
     headers: { "Content-Type": "text/xml" },
   });
-}
-
-// Twilio signs the exact public URL it POSTed to. Behind a proxy (Vercel,
-// ngrok) request.url can carry an internal host, so rebuild it from the
-// forwarded headers when present.
-function getPublicUrl(request: NextRequest): string {
-  const forwardedHost =
-    request.headers.get("x-forwarded-host") ?? request.headers.get("host");
-  if (!forwardedHost) return request.url;
-  const proto = request.headers.get("x-forwarded-proto") ?? "https";
-  const { pathname, search } = new URL(request.url);
-  return `${proto}://${forwardedHost}${pathname}${search}`;
 }
 
 // Phone numbers must never appear in full in any log line.
@@ -69,16 +57,12 @@ export async function POST(request: NextRequest) {
   });
 
   // 3: validate the request really came from Twilio.
-  const signature = request.headers.get("x-twilio-signature") ?? "";
-  const url = getPublicUrl(request);
-  const authToken = process.env.TWILIO_AUTH_TOKEN ?? "";
-
-  const isValid = validateRequest(authToken, signature, url, params);
-  if (!isValid) {
+  const check = verifyTwilioRequest(request, params);
+  if (!check.valid) {
     console.warn("[twilio-webhook] signature validation FAILED", {
-      url,
-      hasSignature: Boolean(signature),
-      hasAuthToken: Boolean(authToken),
+      url: check.url,
+      hasSignature: check.hasSignature,
+      hasAuthToken: check.hasAuthToken,
     });
     return new Response("Forbidden", { status: 403 });
   }

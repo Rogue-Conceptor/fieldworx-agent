@@ -28,6 +28,19 @@ export function outcomeTone(outcome: string): Tone {
   }
 }
 
+// messages.delivery_status (Twilio's status for a text we sent)
+export function deliveryTone(status: string): Tone {
+  switch (status) {
+    case "delivered":
+      return "green";
+    case "undelivered":
+    case "failed":
+      return "red";
+    default: // accepted, scheduled, queued, sending, sent, read
+      return "gray";
+  }
+}
+
 // conversation, lead, and appointment statuses
 export function statusTone(status: string | null | undefined): Tone {
   switch (status) {

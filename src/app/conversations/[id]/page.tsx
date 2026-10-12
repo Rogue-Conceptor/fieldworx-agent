@@ -4,7 +4,7 @@ import { createClient } from "@/lib/supabase/server";
 import { formatCentral } from "@/lib/format/time";
 import { maskPhone } from "@/lib/format/phone";
 import AutoRefresh from "../AutoRefresh";
-import Badge, { outcomeTone, statusTone } from "../Badge";
+import Badge, { deliveryTone, outcomeTone, statusTone } from "../Badge";
 
 export const dynamic = "force-dynamic";
 
@@ -26,7 +26,15 @@ type Conversation = {
   updated_at: string;
   lead_id: string;
 };
-type Message = { id: string; direction: string; body: string | null; created_at: string };
+type Message = {
+  id: string;
+  direction: string;
+  body: string | null;
+  created_at: string;
+  delivery_status: string | null;
+  delivery_error_code: string | null;
+  delivery_updated_at: string | null;
+};
 type ToolCall = {
   name: string;
   ok: boolean;
@@ -58,6 +66,12 @@ type Notification = {
   status: string;
   created_at: string;
 };
+
+// "delivered", "sent", ...; the Twilio error code follows a failure: "undelivered (30007)".
+function deliveryLabel(status: string, errorCode: string | null): string {
+  const failed = status === "undelivered" || status === "failed";
+  return failed && errorCode ? `${status} (${errorCode})` : status;
+}
 
 function seconds(ms: number | null): string {
   return ms === null || ms === undefined ? "—" : `${(ms / 1000).toFixed(1)} s`;
@@ -188,7 +202,9 @@ export default async function ConversationPage({ params }: { params: { id: strin
     await Promise.all([
       supabase
         .from("messages")
-        .select("id, direction, body, created_at")
+        .select(
+          "id, direction, body, created_at, delivery_status, delivery_error_code, delivery_updated_at",
+        )
         .eq("conversation_id", conversation.id)
         .order("created_at", { ascending: true }),
       supabase
@@ -301,6 +317,14 @@ export default async function ConversationPage({ params }: { params: { id: strin
                     <p className="mt-1 text-[11px] text-neutral-500">
                       {formatCentral(m.created_at, "time")}
                       {isOptIn && " · opt-in confirmation · system"}
+                      {!inbound && m.delivery_status && (
+                        <>
+                          {" · "}
+                          <Badge tone={deliveryTone(m.delivery_status)}>
+                            {deliveryLabel(m.delivery_status, m.delivery_error_code)}
+                          </Badge>
+                        </>
+                      )}
                     </p>
                   </div>
                   {run && <RunTrace run={run} />}

@@ -305,6 +305,182 @@ async function main() {
   eq("sendEmail log mode: fetch never called", fetchCalls, 0);
 
   // ------------------------------------------------------------------
+  section("send: delivery-status callback URL from PUBLIC_BASE_URL");
+  const { sendOutbound, statusCallbackUrl } = await import("../../src/lib/agent/send");
+  const CALLBACK = "https://x.example/api/webhooks/twilio/status";
+  eq("statusCallbackUrl: https base", statusCallbackUrl("https://x.example"), CALLBACK);
+  eq("statusCallbackUrl: one trailing slash gives no double slash", statusCallbackUrl("https://x.example/"), CALLBACK);
+  eq("statusCallbackUrl: several trailing slashes", statusCallbackUrl("https://x.example///"), CALLBACK);
+  eq("statusCallbackUrl: surrounding spaces", statusCallbackUrl("  https://x.example  "), CALLBACK);
+  for (const bad of [undefined, "", "   ", "http://x.example", "x.example", "not a url", "ftp://x.example", "https://", "https://x.example?a=1", "https://x.example#f", "https://user:pw@x.example"]) {
+    eq(`statusCallbackUrl(${JSON.stringify(bad)}) -> null`, statusCallbackUrl(bad), null);
+  }
+
+  type CreateParams = { to: string; from: string; body: string; statusCallback?: string };
+  const sendWith = async (base: string | undefined, mode: "log" | "send" = "send") => {
+    const saved = process.env.PUBLIC_BASE_URL;
+    if (base === undefined) delete process.env.PUBLIC_BASE_URL;
+    else process.env.PUBLIC_BASE_URL = base;
+    const created: CreateParams[] = [];
+    const client = {
+      messages: {
+        create: async (params: CreateParams) => {
+          created.push(params);
+          return { sid: "SM123" };
+        },
+      },
+    };
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...parts: unknown[]) => {
+      warnings.push(parts.map(String).join(" "));
+    };
+    try {
+      const result = await sendOutbound({ to: "+15555550100", from: "+15555550199", body: "Hello" }, { mode, client });
+      return { result, created, warnings };
+    } finally {
+      console.warn = originalWarn;
+      if (saved === undefined) delete process.env.PUBLIC_BASE_URL;
+      else process.env.PUBLIC_BASE_URL = saved;
+    }
+  };
+  const PLAIN = { to: "+15555550100", from: "+15555550199", body: "Hello" };
+
+  const goodSend = await sendWith("https://x.example");
+  eq("send, https PUBLIC_BASE_URL: create called once, with the exact statusCallback", goodSend.created, [{ ...PLAIN, statusCallback: CALLBACK }]);
+  eq("send, https PUBLIC_BASE_URL: returns the SID", goodSend.result, { sid: "SM123", sent: true });
+  eq("send, https PUBLIC_BASE_URL: no warning", goodSend.warnings, []);
+  for (const [label, base] of [["unset", undefined], ["http://", "http://secret-host.example"], ["garbage", "secret garbage"]] as const) {
+    const sent = await sendWith(base);
+    eq(`send, PUBLIC_BASE_URL ${label}: the text is still sent, without statusCallback`, sent.created, [PLAIN]);
+    eq(`send, PUBLIC_BASE_URL ${label}: returns the SID`, sent.result, { sid: "SM123", sent: true });
+    eq(`send, PUBLIC_BASE_URL ${label}: exactly one warning`, sent.warnings.length, 1);
+    check(`send, PUBLIC_BASE_URL ${label}: the warning does not echo the value`, !sent.warnings.join(" ").includes("secret"), sent.warnings);
+  }
+  const logSend = await sendWith("https://x.example", "log");
+  eq("send, log mode: Twilio never called, nothing sent, no warning", [logSend.created.length, logSend.result, logSend.warnings], [0, { sid: null, sent: false }, []]);
+
+  // ------------------------------------------------------------------
+  section("status callback handler (src/lib/twilio/status.ts)");
+  const { handleStatusCallback } = await import("../../src/lib/twilio/status");
+  type RpcCall = { fn: string; args: Record<string, unknown> };
+  const runStatus = async (params: Record<string, string>, opts: { valid?: boolean; rpc?: "ok" | "error" | "throw" } = {}) => {
+    const rpcCalls: RpcCall[] = [];
+    const logs: string[] = [];
+    const original = { warn: console.warn, error: console.error };
+    const capture = (...parts: unknown[]) => {
+      logs.push(parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" "));
+    };
+    console.warn = capture;
+    console.error = capture;
+    try {
+      const status = await handleStatusCallback(params, {
+        verify: () => ({ valid: opts.valid !== false, url: CALLBACK, hasSignature: true, hasAuthToken: true }),
+        rpc: async (fn, args) => {
+          rpcCalls.push({ fn, args });
+          if (opts.rpc === "throw") throw new Error("connection to +15555550100 reset");
+          return { error: opts.rpc === "error" ? { message: "boom for +15555550100", code: "XX000" } : null };
+        },
+      });
+      return { status, rpcCalls, logs };
+    } finally {
+      console.warn = original.warn;
+      console.error = original.error;
+    }
+  };
+  const noLeak = (logs: string[]) => !/5555550100|boom|reset/.test(logs.join(" "));
+
+  const delivered = await runStatus({ MessageSid: "SM1", MessageStatus: "delivered" });
+  eq("status: valid + delivered -> 200", delivered.status, 200);
+  eq("status: valid + delivered -> rpc record_message_status(sid, delivered, null)", delivered.rpcCalls, [{ fn: "record_message_status", args: { p_sid: "SM1", p_status: "delivered", p_error_code: null } }]);
+  const undelivered = await runStatus({ MessageSid: "SM2", MessageStatus: "undelivered", ErrorCode: "30007" });
+  eq("status: undelivered + ErrorCode 30007 -> 200", undelivered.status, 200);
+  eq("status: undelivered + ErrorCode 30007 -> the code is passed through", undelivered.rpcCalls, [{ fn: "record_message_status", args: { p_sid: "SM2", p_status: "undelivered", p_error_code: "30007" } }]);
+  const emptyCode = await runStatus({ MessageSid: "SM3", MessageStatus: "sent", ErrorCode: "" });
+  eq("status: an empty ErrorCode is passed as null", emptyCode.rpcCalls.map((c) => c.args.p_error_code), [null]);
+
+  const forged = await runStatus({ MessageSid: "SM4", MessageStatus: "delivered" }, { valid: false });
+  eq("status: invalid signature -> 403", forged.status, 403);
+  eq("status: invalid signature -> rpc NOT called", forged.rpcCalls.length, 0);
+  check("status: invalid signature -> one fixed warning", forged.logs.length === 1 && forged.logs[0].startsWith("[twilio-status] signature validation FAILED"), forged.logs);
+
+  const dbError = await runStatus({ MessageSid: "SM5", MessageStatus: "delivered" }, { rpc: "error" });
+  eq("status: rpc returns an error -> still 200", dbError.status, 200);
+  eq("status: rpc returns an error -> one fixed log line", dbError.logs, ["[twilio-status] status update failed"]);
+  check("status: rpc returns an error -> the log has no phone number or error text", noLeak(dbError.logs), dbError.logs);
+  const dbThrow = await runStatus({ MessageSid: "SM6", MessageStatus: "delivered" }, { rpc: "throw" });
+  eq("status: rpc throws -> still 200", dbThrow.status, 200);
+  eq("status: rpc throws -> the same fixed log line", dbThrow.logs, ["[twilio-status] status update failed"]);
+  check("status: rpc throws -> the log has no phone number or error text", noLeak(dbThrow.logs), dbThrow.logs);
+
+  const noSid = await runStatus({ MessageStatus: "delivered" });
+  eq("status: missing MessageSid -> 200", noSid.status, 200);
+  eq("status: missing MessageSid -> rpc not called", noSid.rpcCalls.length, 0);
+  const noStatus = await runStatus({ MessageSid: "SM7" });
+  eq("status: missing MessageStatus -> 200, rpc not called", [noStatus.status, noStatus.rpcCalls.length], [200, 0]);
+
+  // ------------------------------------------------------------------
+  section("shared Twilio signature check (src/lib/twilio/verify.ts) vs the old inline route code");
+  const { getPublicUrl, verifyTwilioRequest } = await import("../../src/lib/twilio/verify");
+  // The SDK sets these on its default export (not as named ESM exports).
+  const { getExpectedTwilioSignature, validateRequest } = (await import("twilio")).default;
+  type FakeRequest = { url: string; headers: Headers };
+  // The inbound route's own code from before it moved to verify.ts, as it was.
+  const legacyPublicUrl = (request: FakeRequest): string => {
+    const forwardedHost =
+      request.headers.get("x-forwarded-host") ?? request.headers.get("host");
+    if (!forwardedHost) return request.url;
+    const proto = request.headers.get("x-forwarded-proto") ?? "https";
+    const { pathname, search } = new URL(request.url);
+    return `${proto}://${forwardedHost}${pathname}${search}`;
+  };
+  const legacyAccepts = (request: FakeRequest, params: Record<string, string>): boolean => {
+    const signature = request.headers.get("x-twilio-signature") ?? "";
+    const url = legacyPublicUrl(request);
+    const authToken = process.env.TWILIO_AUTH_TOKEN ?? "";
+    return validateRequest(authToken, signature, url, params);
+  };
+  const TOKEN = "test-auth-token";
+  const form = { MessageSid: "SMabc", MessageStatus: "delivered", To: "+15555550100" };
+  const signed = (publicUrl: string, params: Record<string, string> = form) => getExpectedTwilioSignature(TOKEN, publicUrl, params);
+  const request = (url: string, headers: Record<string, string>): FakeRequest => ({ url, headers: new Headers(headers) });
+  const sameAsBefore = (label: string, req: FakeRequest, params: Record<string, string>, expected: boolean) => {
+    const now = verifyTwilioRequest(req, params);
+    const before = legacyAccepts(req, params);
+    check(
+      `${label}: ${expected ? "accepted" : "rejected"}, same as the old route code, same public URL`,
+      now.valid === expected && before === expected && getPublicUrl(req) === legacyPublicUrl(req) && now.url === legacyPublicUrl(req),
+      { now: now.valid, before },
+    );
+  };
+
+  const savedToken = process.env.TWILIO_AUTH_TOKEN;
+  process.env.TWILIO_AUTH_TOKEN = TOKEN;
+  const INTERNAL = "http://localhost:3000/api/webhooks/twilio";
+  const proxied = (sig: string, extra: Record<string, string> = {}) =>
+    request(INTERNAL, { "x-forwarded-host": "abc.ngrok.app", "x-forwarded-proto": "https", "x-twilio-signature": sig, ...extra });
+  sameAsBefore("proxy: forwarded host and proto, signed for the public URL", proxied(signed("https://abc.ngrok.app/api/webhooks/twilio")), form, true);
+  sameAsBefore("proxy: signed for the internal URL instead", proxied(signed(INTERNAL)), form, false);
+  sameAsBefore("Host header only (proto defaults to https)", request(INTERNAL, { host: "abc.example", "x-twilio-signature": signed("https://abc.example/api/webhooks/twilio") }), form, true);
+  sameAsBefore("forwarded proto http, signed for http", request(INTERNAL, { "x-forwarded-host": "abc.example", "x-forwarded-proto": "http", "x-twilio-signature": signed("http://abc.example/api/webhooks/twilio") }), form, true);
+  sameAsBefore("forwarded proto http, signed for https", request(INTERNAL, { "x-forwarded-host": "abc.example", "x-forwarded-proto": "http", "x-twilio-signature": signed("https://abc.example/api/webhooks/twilio") }), form, false);
+  sameAsBefore("no host headers: request.url is used as is", request("https://direct.example/api/webhooks/twilio", { "x-twilio-signature": signed("https://direct.example/api/webhooks/twilio") }), form, true);
+  sameAsBefore("query string is part of the signed URL (signed with it)", request("http://localhost:3000/api/webhooks/twilio?x=1", { "x-forwarded-host": "abc.example", "x-twilio-signature": signed("https://abc.example/api/webhooks/twilio?x=1") }), form, true);
+  sameAsBefore("query string is part of the signed URL (signed without it)", request("http://localhost:3000/api/webhooks/twilio?x=1", { "x-forwarded-host": "abc.example", "x-twilio-signature": signed("https://abc.example/api/webhooks/twilio") }), form, false);
+  sameAsBefore("wrong signature", proxied("AAAAAAAAAAAAAAAAAAAAAAAAAAA="), form, false);
+  sameAsBefore("missing signature header", request(INTERNAL, { "x-forwarded-host": "abc.ngrok.app" }), form, false);
+  sameAsBefore("params changed after signing", proxied(signed("https://abc.ngrok.app/api/webhooks/twilio")), { ...form, MessageStatus: "failed" }, false);
+  const flags = verifyTwilioRequest(proxied(""), form);
+  eq("failure log fields: no signature header", [flags.hasSignature, flags.hasAuthToken], [false, true]);
+  delete process.env.TWILIO_AUTH_TOKEN;
+  sameAsBefore("TWILIO_AUTH_TOKEN unset", proxied(signed("https://abc.ngrok.app/api/webhooks/twilio")), form, false);
+  eq("failure log fields: no auth token", verifyTwilioRequest(proxied("x"), form).hasAuthToken, false);
+  if (savedToken === undefined) delete process.env.TWILIO_AUTH_TOKEN;
+  else process.env.TWILIO_AUTH_TOKEN = savedToken;
+
+  eq("send, status and verify tests: fetch never called", fetchCalls, 0);
+
+  // ------------------------------------------------------------------
   console.log(`\nTotal: ${passed + failed} cases, ${passed} passed, ${failed} failed`);
   console.log(failed === 0 ? "ALL PASS" : "SOME FAILED");
   process.exit(failed === 0 ? 0 : 1);
